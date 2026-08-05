@@ -12,7 +12,18 @@ use std::sync::mpsc;
 use llama_cpp_4::prelude::*;
 
 use crate::config::InferenceConfig;
-use crate::protocol::{InferCmd, LlamaError, PreparedCmd, Request};
+use crate::protocol::{InferCmd, LlamaError, PreparedCmd, RANDOM_SEED, Request, SamplingParams};
+
+/// Default sampling parameters: the Liquid AI LFM2.5 model-card values.
+///
+/// These are *defaults*, not policy — every one is overridable per request.
+/// They are one vendor's recommendation for one model family, and a crate
+/// that loads arbitrary GGUFs must not silently impose them.
+const DEFAULT_TEMPERATURE: f32 = 0.1;
+const DEFAULT_TOP_K: i32 = 50;
+const DEFAULT_TOP_P: f32 = 0.95;
+const DEFAULT_REPEAT_PENALTY: f32 = 1.05;
+const DEFAULT_REPEAT_LAST_N: i32 = -1;
 
 pub(crate) fn clamp_temperature(raw: f32) -> f32 {
     if raw.is_nan() || raw.is_sign_negative() {
@@ -22,6 +33,55 @@ pub(crate) fn clamp_temperature(raw: f32) -> f32 {
     } else {
         raw
     }
+}
+
+/// Resolve one optional float: `None` or NaN falls back to `default`,
+/// anything else is clamped into `[lo, hi]`.
+///
+/// NaN resolves to the default rather than to a bound: a NaN top-p is a
+/// caller mistake, and silently turning it into 0.0 would collapse the
+/// candidate set to a single token with no diagnostic.
+fn resolve_f32(raw: Option<f32>, default: f32, lo: f32, hi: f32) -> f32 {
+    match raw {
+        Some(v) if !v.is_nan() => v.clamp(lo, hi),
+        _ => default,
+    }
+}
+
+/// Sampling parameters for a request, with defaults applied and every value
+/// clamped into a range llama.cpp accepts.
+pub(crate) fn resolve_sampling(request: &Request) -> SamplingParams {
+    SamplingParams {
+        temperature: clamp_temperature(request.temperature.unwrap_or(DEFAULT_TEMPERATURE)),
+        // 0 disables top-k in llama.cpp; negatives are meaningless.
+        top_k: request.top_k.unwrap_or(DEFAULT_TOP_K).max(0),
+        top_p: resolve_f32(request.top_p, DEFAULT_TOP_P, 0.0, 1.0),
+        repeat_penalty: resolve_f32(request.repeat_penalty, DEFAULT_REPEAT_PENALTY, 0.0, 2.0),
+        // -1 means "the whole context"; anything below that is meaningless.
+        repeat_last_n: request.repeat_last_n.unwrap_or(DEFAULT_REPEAT_LAST_N).max(-1),
+        // No seed means a fresh random one per request, so two identical
+        // requests at a non-zero temperature do not return identical text.
+        seed: request.seed.unwrap_or(RANDOM_SEED),
+    }
+}
+
+/// Drop stop sequences that cannot match usefully.
+///
+/// An empty string is a prefix of every position, so keeping one would end
+/// generation before the first token and hand back an empty completion. It is
+/// dropped rather than rejected: an empty entry is almost always an artifact
+/// of building the list programmatically, not a deliberate request.
+pub(crate) fn normalize_stop(stop: &[String]) -> Vec<String> {
+    stop.iter().filter(|s| !s.is_empty()).cloned().collect()
+}
+
+/// A request that has cleared preprocessing: templated, tokenized,
+/// budget-checked, with sampling resolved and stop sequences normalized.
+pub(crate) struct Prepared {
+    pub tokens: Vec<LlamaToken>,
+    pub max_gen: u32,
+    pub sampling: SamplingParams,
+    pub stop: Vec<String>,
 }
 
 pub(crate) fn build_messages(
@@ -58,17 +118,16 @@ pub(crate) fn compute_max_gen(
 }
 
 /// Resolve the generation parameters for a tokenized prompt, applying the
-/// request defaults: `max_tokens` defaults to 256, `temperature` to 0.1
-/// (then clamped). Extracted from [`prepare_request`] so the defaults
-/// contract is unit-testable without a loaded model.
+/// request defaults: `max_tokens` defaults to 256, and every sampling field
+/// to its model-card value (then clamped). Extracted from [`prepare_request`]
+/// so the defaults contract is unit-testable without a loaded model.
 pub(crate) fn resolve_defaults(
     n_prompt: usize,
     request: &Request,
     per_slot_budget: u32,
-) -> std::result::Result<(u32, f32), LlamaError> {
+) -> std::result::Result<(u32, SamplingParams), LlamaError> {
     let max_gen = compute_max_gen(n_prompt, request.max_tokens, per_slot_budget)?;
-    let temperature = clamp_temperature(request.temperature.unwrap_or(0.1));
-    Ok((max_gen, temperature))
+    Ok((max_gen, resolve_sampling(request)))
 }
 
 /// Template, tokenize, and budget-check a request. Pure model reads only.
@@ -76,7 +135,7 @@ pub(crate) fn prepare_request(
     model: &LlamaModel,
     request: &Request,
     per_slot_budget: u32,
-) -> std::result::Result<(Vec<LlamaToken>, u32, f32), LlamaError> {
+) -> std::result::Result<Prepared, LlamaError> {
     let messages = build_messages(request)?;
     let prompt = model
         .apply_chat_template(None, &messages, true)
@@ -84,8 +143,13 @@ pub(crate) fn prepare_request(
     let tokens = model
         .str_to_token(&prompt, AddBos::Always)
         .map_err(|e| LlamaError::Inference(e.to_string()))?;
-    let (max_gen, temperature) = resolve_defaults(tokens.len(), request, per_slot_budget)?;
-    Ok((tokens, max_gen, temperature))
+    let (max_gen, sampling) = resolve_defaults(tokens.len(), request, per_slot_budget)?;
+    Ok(Prepared {
+        tokens,
+        max_gen,
+        sampling,
+        stop: normalize_stop(&request.stop),
+    })
 }
 
 /// Preprocess thread: receive raw client commands, prepare them, forward
@@ -110,11 +174,12 @@ pub(super) fn preprocess_loop(
     for cmd in cmd_rx {
         match cmd {
             InferCmd::Run { request, resp } => match prepare_request(&model, &request, budget) {
-                Ok((tokens, max_gen, temperature)) => {
+                Ok(p) => {
                     match prepared_tx.send(PreparedCmd::Run {
-                        tokens,
-                        max_gen,
-                        temperature,
+                        tokens: p.tokens,
+                        max_gen: p.max_gen,
+                        sampling: p.sampling,
+                        stop: p.stop,
                         resp,
                     }) {
                         Ok(()) => {}
@@ -133,11 +198,12 @@ pub(super) fn preprocess_loop(
                 token_tx,
                 done_tx,
             } => match prepare_request(&model, &request, budget) {
-                Ok((tokens, max_gen, temperature)) => {
+                Ok(p) => {
                     match prepared_tx.send(PreparedCmd::RunStream {
-                        tokens,
-                        max_gen,
-                        temperature,
+                        tokens: p.tokens,
+                        max_gen: p.max_gen,
+                        sampling: p.sampling,
+                        stop: p.stop,
                         token_tx,
                         done_tx,
                     }) {
@@ -238,26 +304,113 @@ mod tests {
         // these via resolve_defaults after tokenizing; the defaults live
         // here, not in Request (the protocol.rs mirror test was removed).
         let req = Request::new("hello");
-        let (max_gen, temperature) = resolve_defaults(10, &req, 512).unwrap();
-        assert_eq!(temperature, 0.1);
+        let (max_gen, sampling) = resolve_defaults(10, &req, 512).unwrap();
+        assert_eq!(sampling.temperature, 0.1);
         assert_eq!(max_gen, 256);
+    }
+
+    // ── resolve_sampling ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_sampling_defaults_match_the_model_card() {
+        let p = resolve_sampling(&Request::new("hi"));
+        assert_eq!(p.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(p.top_k, DEFAULT_TOP_K);
+        assert_eq!(p.top_p, DEFAULT_TOP_P);
+        assert_eq!(p.repeat_penalty, DEFAULT_REPEAT_PENALTY);
+        assert_eq!(p.repeat_last_n, DEFAULT_REPEAT_LAST_N);
+    }
+
+    #[test]
+    fn test_resolve_sampling_seed_defaults_to_random() {
+        // Without this, every request shares one fixed seed and identical
+        // prompts return identical text no matter the temperature.
+        assert_eq!(resolve_sampling(&Request::new("hi")).seed, RANDOM_SEED);
+    }
+
+    #[test]
+    fn test_resolve_sampling_honours_an_explicit_seed() {
+        let req = Request::new("hi").with_seed(42);
+        assert_eq!(resolve_sampling(&req).seed, 42);
+    }
+
+    #[test]
+    fn test_resolve_sampling_passes_every_override_through() {
+        let req = Request::new("hi")
+            .with_temperature(0.8)
+            .with_top_k(7)
+            .with_top_p(0.3)
+            .with_repeat_penalty(1.5)
+            .with_repeat_last_n(64)
+            .with_seed(9);
+        let p = resolve_sampling(&req);
+        assert_eq!(p.temperature, 0.8);
+        assert_eq!(p.top_k, 7);
+        assert_eq!(p.top_p, 0.3);
+        assert_eq!(p.repeat_penalty, 1.5);
+        assert_eq!(p.repeat_last_n, 64);
+        assert_eq!(p.seed, 9);
+    }
+
+    #[test]
+    fn test_resolve_sampling_clamps_out_of_range_values() {
+        let req = Request::new("hi")
+            .with_top_k(-5) // negative top-k is meaningless → 0 (disabled)
+            .with_top_p(3.0) // above 1 → clamped to 1
+            .with_repeat_penalty(99.0) // → clamped to 2
+            .with_repeat_last_n(-9); // below -1 → -1 (whole context)
+        let p = resolve_sampling(&req);
+        assert_eq!(p.top_k, 0);
+        assert_eq!(p.top_p, 1.0);
+        assert_eq!(p.repeat_penalty, 2.0);
+        assert_eq!(p.repeat_last_n, -1);
+    }
+
+    #[test]
+    fn test_resolve_sampling_nan_falls_back_to_defaults() {
+        let req = Request::new("hi")
+            .with_top_p(f32::NAN)
+            .with_repeat_penalty(f32::NAN);
+        let p = resolve_sampling(&req);
+        assert_eq!(p.top_p, DEFAULT_TOP_P);
+        assert_eq!(p.repeat_penalty, DEFAULT_REPEAT_PENALTY);
+    }
+
+    #[test]
+    fn test_resolve_sampling_zero_top_k_stays_zero() {
+        // 0 is llama.cpp's "top-k disabled", not a value to clamp away.
+        let req = Request::new("hi").with_top_k(0);
+        assert_eq!(resolve_sampling(&req).top_k, 0);
+    }
+
+    // ── normalize_stop ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_stop_keeps_real_sequences_in_order() {
+        let stop = vec!["<|end|>".to_owned(), "STOP".to_owned()];
+        assert_eq!(normalize_stop(&stop), stop);
+    }
+
+    #[test]
+    fn test_normalize_stop_drops_empty_strings() {
+        // An empty stop sequence matches at offset 0, which would end every
+        // generation before its first token and return empty text.
+        let stop = vec![String::new(), "END".to_owned(), String::new()];
+        assert_eq!(normalize_stop(&stop), vec!["END".to_owned()]);
+    }
+
+    #[test]
+    fn test_normalize_stop_empty_input_is_empty() {
+        assert!(normalize_stop(&[]).is_empty());
     }
 
     // ── build_messages ───────────────────────────────────────────────────
 
     #[test]
     fn test_build_messages_system_and_history() {
-        let req = Request {
-            prompt: "hello".into(),
-            system: Some("you are helpful".into()),
-            max_tokens: None,
-            temperature: None,
-            stream: None,
-            history: vec![HistoryMessage {
-                role: "assistant".into(),
-                content: "previous response".into(),
-            }],
-        };
+        let req = Request::new("hello")
+            .with_system("you are helpful")
+            .push_history("assistant", "previous response");
         let msgs = build_messages(&req).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(
@@ -276,14 +429,7 @@ mod tests {
 
     #[test]
     fn test_build_messages_no_system() {
-        let req = Request {
-            prompt: "hi".into(),
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            stream: None,
-            history: vec![],
-        };
+        let req = Request::new("hi");
         let msgs = build_messages(&req).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(
@@ -294,44 +440,20 @@ mod tests {
 
     #[test]
     fn test_build_messages_empty_prompt() {
-        let req = Request {
-            prompt: String::new(),
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            stream: None,
-            history: vec![],
-        };
+        let req = Request::new("");
         let msgs = build_messages(&req).unwrap();
         assert_eq!(msgs.len(), 1);
     }
 
     #[test]
     fn test_build_messages_rejects_null_byte_in_role() {
-        let req = Request {
-            prompt: "hi".into(),
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            stream: None,
-            history: vec![HistoryMessage {
-                role: "user\x00admin".into(),
-                content: "hello".into(),
-            }],
-        };
+        let req = Request::new("hi").push_history("user\x00admin", "hello");
         assert!(build_messages(&req).is_err());
     }
 
     #[test]
     fn test_build_messages_rejects_null_byte_in_content() {
-        let req = Request {
-            prompt: "hi".into(),
-            system: Some("sys\x00tem".into()),
-            max_tokens: None,
-            temperature: None,
-            stream: None,
-            history: vec![],
-        };
+        let req = Request::new("hi").with_system("sys\x00tem");
         assert!(build_messages(&req).is_err());
     }
 
@@ -343,14 +465,7 @@ mod tests {
                 content: format!("message {i}"),
             })
             .collect();
-        let req = Request {
-            prompt: "final".into(),
-            system: None,
-            max_tokens: None,
-            temperature: None,
-            stream: None,
-            history,
-        };
+        let req = Request::new("final").with_history(history);
         let msgs = build_messages(&req).unwrap();
         assert_eq!(msgs.len(), 101);
         // History lands in order, then the user prompt closes the list.

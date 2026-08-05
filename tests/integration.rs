@@ -227,6 +227,137 @@ fn batch_overflow_streaming_queues_fifth() {
     engine.shutdown();
 }
 
+// ─── Stop sequences ────────────────────────────────────────────────────────
+
+#[serial]
+#[test]
+fn stop_sequence_truncates_the_completion() {
+    // Greedy decoding (temperature 0.0) makes the model's output stable, so a
+    // marker lifted out of an unconstrained run is guaranteed to appear in a
+    // second run of the same prompt. That sidesteps guessing what a 230M model
+    // will say while still exercising the real generation loop.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let base = Request::new("Count from one to ten.")
+        .with_temperature(0.0)
+        .with_max_tokens(40);
+
+    let full = client.complete(base.clone()).expect("unconstrained run");
+    assert!(
+        full.text.chars().count() > 6,
+        "need a few characters to cut at, got {:?}",
+        full.text
+    );
+
+    // A two-character marker starting at the third character, sliced on char
+    // boundaries so multi-byte output cannot panic.
+    let start = full.text.char_indices().nth(2).unwrap().0;
+    let end = full.text[start..]
+        .char_indices()
+        .nth(2)
+        .map(|(i, _)| start + i)
+        .unwrap_or(full.text.len());
+    let marker = full.text[start..end].to_owned();
+
+    let stopped = client
+        .complete(base.push_stop(marker.clone()))
+        .expect("stopped run");
+
+    assert!(
+        !stopped.text.contains(&marker),
+        "stop text {marker:?} must not appear in {:?}",
+        stopped.text
+    );
+    assert!(
+        full.text.starts_with(&stopped.text),
+        "stopped output {:?} must be a prefix of {:?}",
+        stopped.text,
+        full.text
+    );
+    assert!(
+        stopped.text.len() < full.text.len(),
+        "stopping must shorten the output"
+    );
+}
+
+#[serial]
+#[test]
+fn stop_sequence_truncates_a_streamed_completion() {
+    // The streamed bytes must agree with the final result: no fragment of the
+    // stop sequence may leak to the client before the match resolves.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let base = Request::new("Count from one to ten.")
+        .with_temperature(0.0)
+        .with_max_tokens(40);
+
+    let full = client.complete(base.clone()).expect("unconstrained run");
+    let start = full.text.char_indices().nth(2).unwrap().0;
+    let end = full.text[start..]
+        .char_indices()
+        .nth(2)
+        .map(|(i, _)| start + i)
+        .unwrap_or(full.text.len());
+    let marker = full.text[start..end].to_owned();
+
+    let mut stream = client
+        .complete_stream(base.push_stop(marker.clone()))
+        .expect("start stream");
+    let mut streamed = String::new();
+    while let Some(tok) = stream.next_token() {
+        streamed.push_str(&tok);
+    }
+    let result = stream.into_result().expect("stream result");
+
+    assert_eq!(
+        streamed, result.text,
+        "streamed text must match the final result exactly"
+    );
+    assert!(
+        !streamed.contains(&marker),
+        "stop text {marker:?} leaked into the stream"
+    );
+}
+
+// ─── Sampling seed ─────────────────────────────────────────────────────────
+
+#[serial]
+#[test]
+fn identical_requests_vary_without_an_explicit_seed() {
+    // The defect this guards: a hardcoded sampler seed made every request with
+    // the same prompt return byte-identical text, so `temperature` had no
+    // observable effect across requests. Three samples at temperature 1.0 over
+    // 40 tokens of a 65K vocabulary — all three matching would mean the seed
+    // is pinned, not that sampling got lucky.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let req = Request::new("Invent a short unusual sentence.")
+        .with_temperature(1.0)
+        .with_max_tokens(40);
+
+    let a = client.complete(req.clone()).expect("first").text;
+    let b = client.complete(req.clone()).expect("second").text;
+    let c = client.complete(req).expect("third").text;
+
+    assert!(
+        !(a == b && b == c),
+        "three unseeded samples were identical, seed appears pinned: {a:?}"
+    );
+}
+
+#[serial]
+#[test]
+fn an_explicit_seed_reproduces_the_same_text() {
+    // The other half of the contract: opting into a seed must give back
+    // reproducibility, which is what makes the random default safe to ship.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let req = Request::new("Invent a short unusual sentence.")
+        .with_temperature(1.0)
+        .with_max_tokens(40)
+        .with_seed(20260805);
+
+    let first = client.complete(req.clone()).expect("first").text;
+    let second = client.complete(req).expect("second").text;
+    assert_eq!(first, second, "a pinned seed must be reproducible");
+}
+
 // ─── Multi-turn slot recycling ─────────────────────────────────────────────
 
 #[serial]

@@ -15,7 +15,7 @@ use std::thread;
 use llama_cpp_4::prelude::*;
 
 use crate::preprocess::preprocess_loop;
-use crate::protocol::{InferCmd, InferResult, LlamaError, PreparedCmd};
+use crate::protocol::{InferCmd, InferResult, LlamaError, PreparedCmd, SamplingParams};
 
 type Result<T> = std::result::Result<T, LlamaError>;
 
@@ -26,6 +26,32 @@ use crate::config::InferenceConfig;
 /// Length of the longest common prefix of two token slices.
 fn longest_common_prefix(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Largest index `<= i` that lies on a `char` boundary of `s`.
+///
+/// Stop-sequence bookkeeping slices `text` at offsets derived from byte
+/// lengths, which can land inside a multi-byte character; `str` indexing
+/// panics there. (`str::floor_char_boundary` is still unstable.)
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// What a newly decoded fragment implies for the slot's lifetime.
+#[derive(Debug, PartialEq, Eq)]
+enum Emit {
+    /// Nothing special — keep generating.
+    Continue,
+    /// A stop sequence completed. `text` is already truncated at its start.
+    Stopped,
+    /// The streaming client hung up.
+    Disconnected,
 }
 
 struct Slot {
@@ -43,6 +69,14 @@ struct Slot {
     token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
     cache_tokens: Vec<LlamaToken>,
+    /// Stop sequences, already stripped of empty entries by preprocessing.
+    stop: Vec<String>,
+    /// Longest stop sequence in bytes; 0 when there are none. Bounds both the
+    /// search window and the streaming hold-back.
+    stop_max_len: usize,
+    /// Byte offset in `text` already handed to `token_tx`. Trails `text.len()`
+    /// whenever the tail could still grow into a stop sequence.
+    emitted: usize,
 }
 
 impl Slot {
@@ -78,19 +112,103 @@ impl Slot {
         ))
     }
 
-    /// Accumulate a generated fragment and forward it to a streaming client.
+    /// Byte offset of the earliest completed stop sequence, or `None`.
+    ///
+    /// Only the tail is searched: a match that completes with the `piece_len`
+    /// bytes just appended cannot start earlier than
+    /// `piece_len + stop_max_len - 1` back from the end, and everything before
+    /// that was already scanned on a previous token.
+    fn find_stop(&self, piece_len: usize) -> Option<usize> {
+        if self.stop.is_empty() {
+            return None;
+        }
+        let window = piece_len + self.stop_max_len.saturating_sub(1);
+        let from = floor_char_boundary(&self.text, self.text.len().saturating_sub(window));
+        self.stop
+            .iter()
+            .filter_map(|s| self.text[from..].find(s.as_str()).map(|i| from + i))
+            .min()
+    }
+
+    /// How many trailing bytes must be withheld from the stream because they
+    /// could still grow into a stop sequence.
+    ///
+    /// This is the length of the longest suffix of `text` that is a proper
+    /// prefix of some stop sequence — zero when the tail cannot lead anywhere.
+    /// Computing it per token rather than always withholding `stop_max_len - 1`
+    /// bytes keeps streaming latency at zero for the overwhelmingly common
+    /// case where the output looks nothing like a stop sequence.
+    fn holdback(&self) -> usize {
+        if self.stop.is_empty() {
+            return 0;
+        }
+        let max = self.stop_max_len.saturating_sub(1);
+        let start = floor_char_boundary(&self.text, self.text.len().saturating_sub(max));
+        // Ascending cut means descending tail length, so the first hit is the
+        // longest qualifying suffix.
+        for cut in start..self.text.len() {
+            if !self.text.is_char_boundary(cut) {
+                continue;
+            }
+            let tail = &self.text[cut..];
+            if self.stop.iter().any(|s| s.starts_with(tail)) {
+                return self.text.len() - cut;
+            }
+        }
+        0
+    }
+
+    /// Stream `text[emitted..end]` to a streaming client, advancing `emitted`.
     /// Returns `false` when that client has disconnected.
-    fn emit(&mut self, piece: &str) -> bool {
-        self.text.push_str(piece);
+    fn flush_to(&mut self, end: usize) -> bool {
+        if end <= self.emitted {
+            return true;
+        }
+        let chunk = self.text[self.emitted..end].to_owned();
+        self.emitted = end;
         if let Some(ref tx) = self.token_tx
-            && tx.send(piece.to_owned()).is_err()
+            && tx.send(chunk).is_err()
         {
             return false;
         }
         true
     }
 
+    /// Accumulate a generated fragment and release whatever is now safe to
+    /// stream, honouring stop sequences.
+    ///
+    /// A stop sequence may span token boundaries, so the decision cannot be
+    /// made per token: bytes that could still become one are withheld until
+    /// the match either completes (generation ends, the stop text is dropped)
+    /// or is ruled out (the bytes are released).
+    fn push_text(&mut self, piece: &str) -> Emit {
+        self.text.push_str(piece);
+
+        if let Some(cut) = self.find_stop(piece.len()) {
+            // Drop the stop sequence and anything after it, then release what
+            // preceded it — that text is real output the client must still
+            // see. `emitted <= cut` always holds here: every byte from `cut`
+            // on was withheld by `holdback` as a growing prefix of this very
+            // match, and `flush_to` no-ops if that were ever violated.
+            self.text.truncate(cut);
+            if !self.flush_to(cut) {
+                return Emit::Disconnected;
+            }
+            return Emit::Stopped;
+        }
+
+        let safe = self.text.len() - self.holdback();
+        if !self.flush_to(safe) {
+            return Emit::Disconnected;
+        }
+        Emit::Continue
+    }
+
     fn finish(&mut self) {
+        // Release anything still withheld for a possible stop match:
+        // generation ended without one, so the tail is ordinary output.
+        let end = self.text.len();
+        let _ = self.flush_to(end);
         let result = InferResult {
             text: std::mem::take(&mut self.text),
             prompt_tokens: self.n_prompt,
@@ -209,30 +327,37 @@ impl SamplerKind {
     }
 }
 
-/// The decoding chain for a temperature. Empty means greedy decoding
-/// (no sampler chain).
-fn sampler_chain(temperature: f32) -> Vec<SamplerKind> {
-    if temperature <= 0.0 {
+/// The decoding chain for a set of resolved parameters. Empty means greedy
+/// decoding (no sampler chain), which ignores every parameter but temperature.
+fn sampler_chain(params: SamplingParams) -> Vec<SamplerKind> {
+    if params.temperature <= 0.0 {
         Vec::new()
     } else {
         vec![
             SamplerKind::Penalties {
-                penalty_last_n: -1,
-                penalty_repeat: 1.05,
+                penalty_last_n: params.repeat_last_n,
+                penalty_repeat: params.repeat_penalty,
             },
-            SamplerKind::TopK { k: 50 },
+            SamplerKind::TopK { k: params.top_k },
             SamplerKind::TopP {
-                p: 0.95,
+                p: params.top_p,
                 min_keep: 1,
             },
-            SamplerKind::Temp { t: temperature },
-            SamplerKind::Dist { seed: 0 },
+            SamplerKind::Temp {
+                t: params.temperature,
+            },
+            // Seeded per request. `RANDOM_SEED` (llama.cpp's
+            // `LLAMA_DEFAULT_SEED`) makes llama.cpp draw a fresh seed, so two
+            // identical requests do not return identical text — a fixed seed
+            // here would make `temperature` unobservable across requests,
+            // since each slot builds its own sampler.
+            SamplerKind::Dist { seed: params.seed },
         ]
     }
 }
 
-fn build_sampler(temperature: f32) -> LlamaSampler {
-    let chain = sampler_chain(temperature);
+fn build_sampler(params: SamplingParams) -> LlamaSampler {
+    let chain = sampler_chain(params);
     if chain.is_empty() {
         LlamaSampler::greedy()
     } else {
@@ -245,14 +370,16 @@ fn build_sampler(temperature: f32) -> LlamaSampler {
 fn create_slot(
     tokens: Vec<LlamaToken>,
     max_gen: u32,
-    temperature: f32,
+    sampling: SamplingParams,
+    stop: Vec<String>,
     resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
     token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
 ) -> Slot {
     let n_prompt = tokens.len();
 
-    let sampler = build_sampler(temperature);
+    let sampler = build_sampler(sampling);
+    let stop_max_len = stop.iter().map(String::len).max().unwrap_or(0);
 
     Slot {
         prompt_tokens: tokens,
@@ -271,6 +398,9 @@ fn create_slot(
         token_tx,
         done_tx,
         cache_tokens: Vec::new(),
+        stop,
+        stop_max_len,
+        emitted: 0,
     }
 }
 
@@ -368,20 +498,30 @@ fn fill_empty_slot(
     // Destructured by value, and before slot selection: cloning `tokens` here
     // would copy the whole tokenized prompt on every request, and
     // `select_slot` needs them to score each free slot's cached prefix.
-    let (tokens, max_gen, temperature, resp, token_tx, done_tx) = match cmd {
+    let (tokens, max_gen, sampling, stop, resp, token_tx, done_tx) = match cmd {
         PreparedCmd::Run {
             tokens,
             max_gen,
-            temperature,
+            sampling,
+            stop,
             resp,
-        } => (tokens, max_gen, temperature, Some(resp), None, None),
+        } => (tokens, max_gen, sampling, stop, Some(resp), None, None),
         PreparedCmd::RunStream {
             tokens,
             max_gen,
-            temperature,
+            sampling,
+            stop,
             token_tx,
             done_tx,
-        } => (tokens, max_gen, temperature, None, Some(token_tx), done_tx),
+        } => (
+            tokens,
+            max_gen,
+            sampling,
+            stop,
+            None,
+            Some(token_tx),
+            done_tx,
+        ),
         PreparedCmd::Shutdown => {
             tracing::warn!("Shutdown received outside of main loop");
             return;
@@ -403,7 +543,15 @@ fn fill_empty_slot(
             return;
         }
     };
-    let mut slot = create_slot(Vec::new(), max_gen, temperature, resp, token_tx, done_tx);
+    let mut slot = create_slot(
+        Vec::new(),
+        max_gen,
+        sampling,
+        stop,
+        resp,
+        token_tx,
+        done_tx,
+    );
     let cached = std::mem::take(&mut slot_cache[idx]);
     let lcp = slot.begin_request(tokens, cached);
     if lcp > 0 {
@@ -436,6 +584,40 @@ fn fill_empty_slot(
 }
 
 // ── Cancel all active slots ───────────────────────────────────────────────────
+
+/// Reconcile a just-finished slot's KV cache with its mirror.
+///
+/// Retains the sequence for prefix reuse when reuse is enabled and the
+/// sequence stayed under the per-slot budget; otherwise clears both the KV and
+/// the mirror. Shared by every normal finish site (EOG, generation cap, stop
+/// sequence) so the retention rules cannot drift apart between them.
+fn retire_slot(
+    ctx: &mut LlamaContext,
+    slot: &mut Slot,
+    slot_cache: &mut [Vec<LlamaToken>],
+    seq_id: usize,
+    reuse: bool,
+    per_slot_budget: u32,
+) {
+    if reuse && (slot.kv_pos as u32) < per_slot_budget {
+        slot_cache[seq_id] = std::mem::take(&mut slot.cache_tokens);
+        // The generated tail [n_prompt, kv_pos) is unreachable by any future
+        // lcp (lcp <= n_prompt always); suffix removal from n_prompt can never
+        // be refused on attention models (the only models where reuse
+        // engages), so `let _` is safe.
+        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), Some(slot.n_prompt as u32), None);
+    } else {
+        // Either reuse is off, or the retention cap fired — the sequence hit
+        // the per-slot budget and is not worth keeping. Clear the seq's KV
+        // *and* the mirror: with the cap, the mirror can still hold a
+        // previously retained sequence, and a stale mirror would make the next
+        // fill compute a bogus lcp and under-clear (silent corruption). When
+        // reuse is off the mirror is always empty already, so clearing it is a
+        // harmless no-op rather than a behaviour change.
+        slot_cache[seq_id].clear();
+        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+    }
+}
 
 fn cancel_all(slots: &mut [Option<Slot>], slot_cache: &mut [Vec<LlamaToken>], err: LlamaError) {
     for (i, slot) in slots.iter_mut().enumerate() {
@@ -803,43 +985,39 @@ fn inference_loop(
 
             if model.is_eog_token(token) {
                 slot.finish();
-                if reuse_allowed(config.kv_cache, kv_rewind)
-                    && (slot.kv_pos as u32) < per_slot_budget
-                {
-                    slot_cache[seq_id] = std::mem::take(&mut slot.cache_tokens);
-                    // The generated tail [n_prompt, kv_pos) is unreachable by any
-                    // future lcp (lcp <= n_prompt always); suffix removal from
-                    // n_prompt can never be refused on attention models (the only
-                    // models where reuse engages), so `let _` is safe.
-                    let _ = ctx.clear_kv_cache_seq(
-                        Some(seq_id as u32),
-                        Some(slot.n_prompt as u32),
-                        None,
-                    );
-                } else if reuse_allowed(config.kv_cache, kv_rewind) {
-                    // Retention cap: the sequence hit/exceeded the per-slot
-                    // budget and is not worth retaining. Full-clear the seq's
-                    // KV AND the mirror — clearing the stale mirror is
-                    // required: with the cap, the mirror can hold a previous
-                    // retained sequence while this one is not retained, and a
-                    // stale mirror would make the next fill compute a bogus
-                    // lcp and under-clear (silent corruption). Prompts are
-                    // preprocess-capped below the budget, so this branch fires
-                    // via kv_pos: generation pushed the sequence to the budget.
-                    slot_cache[seq_id].clear();
-                    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-                } else {
-                    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-                }
+                retire_slot(
+                    &mut ctx,
+                    &mut slot,
+                    &mut slot_cache,
+                    seq_id,
+                    reuse_allowed(config.kv_cache, kv_rewind),
+                    per_slot_budget,
+                );
                 continue;
             }
 
             slot.gen_count += 1;
 
             match slot.push_token(&model, token) {
-                Ok(Some(piece)) => {
-                    if !slot.emit(&piece) {
-                        // Streaming client disconnected — cancel slot
+                Ok(Some(piece)) => match slot.push_text(&piece) {
+                    Emit::Continue => {}
+                    Emit::Stopped => {
+                        // A stop sequence completed. `text` is already
+                        // truncated at the match, so this is an ordinary
+                        // successful finish — the caller gets the output that
+                        // preceded the stop, without the stop text itself.
+                        slot.finish();
+                        retire_slot(
+                            &mut ctx,
+                            &mut slot,
+                            &mut slot_cache,
+                            seq_id,
+                            reuse_allowed(config.kv_cache, kv_rewind),
+                            per_slot_budget,
+                        );
+                        continue;
+                    }
+                    Emit::Disconnected => {
                         slot.cancel(LlamaError::Inference(
                             "streaming client disconnected".into(),
                         ));
@@ -847,7 +1025,7 @@ fn inference_loop(
                         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
                         continue;
                     }
-                }
+                },
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("Detokenization error: {e}");
@@ -857,30 +1035,14 @@ fn inference_loop(
 
             if slot.gen_count as u32 >= slot.max_tokens || slot.kv_pos as u32 >= per_slot_budget {
                 slot.finish();
-                if reuse_allowed(config.kv_cache, kv_rewind)
-                    && (slot.kv_pos as u32) < per_slot_budget
-                {
-                    slot_cache[seq_id] = std::mem::take(&mut slot.cache_tokens);
-                    // See the EOG site: the generated tail [n_prompt, kv_pos) is
-                    // unreachable by any future lcp; suffix removal from n_prompt
-                    // is never refused on attention models, so `let _` is safe.
-                    let _ = ctx.clear_kv_cache_seq(
-                        Some(seq_id as u32),
-                        Some(slot.n_prompt as u32),
-                        None,
-                    );
-                } else if reuse_allowed(config.kv_cache, kv_rewind) {
-                    // Retention cap: same as the EOG site — the sequence is at
-                    // the per-slot budget and not worth retaining; full-clear
-                    // the seq's KV AND the stale mirror (a stale mirror would
-                    // make the next fill compute a bogus lcp and under-clear).
-                    // Prompts are preprocess-capped below the budget, so this
-                    // branch fires via kv_pos: generation hit the budget.
-                    slot_cache[seq_id].clear();
-                    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-                } else {
-                    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-                }
+                retire_slot(
+                    &mut ctx,
+                    &mut slot,
+                    &mut slot_cache,
+                    seq_id,
+                    reuse_allowed(config.kv_cache, kv_rewind),
+                    per_slot_budget,
+                );
                 continue;
             }
 
@@ -1054,32 +1216,13 @@ pub fn start_inference(model_path: impl AsRef<Path>) -> Result<Engine> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_slot_emit_happy_path() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut slot = Slot {
-            prompt_tokens: vec![],
-            n_prompt: 0,
-            gen_count: 0,
-            max_tokens: 10,
-            kv_pos: 0,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
-            text: String::new(),
-            pending_token: None,
-            prompt_phase: false,
-            resp: None,
-            token_tx: Some(tx.clone()),
-            done_tx: None,
-            cache_tokens: vec![],
-        };
-        assert!(slot.emit("hello"));
-        assert_eq!(slot.text, "hello");
-    }
-
-    #[test]
-    fn test_slot_emit_no_token_tx() {
-        let mut slot = Slot {
+    /// A blank slot: no channels, no stop sequences, greedy sampler.
+    ///
+    /// Tests override only the fields they exercise via struct-update syntax
+    /// (`Slot { text: ..., ..base_slot() }`), so adding a field to `Slot` does
+    /// not require touching every test.
+    fn base_slot() -> Slot {
+        Slot {
             prompt_tokens: vec![],
             n_prompt: 0,
             gen_count: 0,
@@ -1094,28 +1237,63 @@ mod tests {
             token_tx: None,
             done_tx: None,
             cache_tokens: vec![],
-        };
-        assert!(slot.emit("world"));
+            stop: vec![],
+            stop_max_len: 0,
+            emitted: 0,
+        }
+    }
+
+    /// A slot that streams to `tx` and stops on `stop`.
+    fn streaming_slot(
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        stop: &[&str],
+    ) -> Slot {
+        let stop: Vec<String> = stop.iter().map(|s| (*s).to_owned()).collect();
+        Slot {
+            token_tx: Some(tx),
+            stop_max_len: stop.iter().map(String::len).max().unwrap_or(0),
+            stop,
+            ..base_slot()
+        }
+    }
+
+    /// Drain everything currently queued on a token receiver.
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        let mut out = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            out.push_str(&chunk);
+        }
+        out
+    }
+
+    #[test]
+    fn test_slot_push_text_streams_and_accumulates() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &[]);
+        assert_eq!(slot.push_text("hello"), Emit::Continue);
+        assert_eq!(slot.text, "hello");
+        // With no stop sequences there is nothing to withhold: the fragment
+        // reaches the client in the same step it was generated.
+        assert_eq!(drain(&mut rx), "hello");
+    }
+
+    #[test]
+    fn test_slot_push_text_no_token_tx() {
+        let mut slot = base_slot();
+        assert_eq!(slot.push_text("world"), Emit::Continue);
+        assert_eq!(slot.text, "world");
     }
 
     #[test]
     fn test_slot_finish_sends_via_resp() {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let mut slot = Slot {
-            prompt_tokens: vec![],
             n_prompt: 3,
             gen_count: 5,
-            max_tokens: 10,
             kv_pos: 5,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
             text: "hello world".into(),
-            pending_token: None,
-            prompt_phase: false,
             resp: Some(resp_tx),
-            token_tx: None,
-            done_tx: None,
-            cache_tokens: vec![],
+            ..base_slot()
         };
         slot.finish();
         let result = resp_rx.blocking_recv().unwrap().unwrap();
@@ -1128,20 +1306,12 @@ mod tests {
     fn test_slot_finish_sends_via_done_tx() {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let mut slot = Slot {
-            prompt_tokens: vec![],
             n_prompt: 1,
             gen_count: 2,
-            max_tokens: 10,
             kv_pos: 3,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
             text: "hi".into(),
-            pending_token: None,
-            prompt_phase: false,
-            resp: None,
-            token_tx: None,
             done_tx: Some(done_tx),
-            cache_tokens: vec![],
+            ..base_slot()
         };
         slot.finish();
         let result = done_rx.blocking_recv().unwrap().unwrap();
@@ -1154,20 +1324,8 @@ mod tests {
 
     fn slot_with_utf8_buf(utf8_buf: Vec<u8>) -> Slot {
         Slot {
-            prompt_tokens: vec![],
-            n_prompt: 0,
-            gen_count: 0,
-            max_tokens: 10,
-            kv_pos: 0,
-            sampler: LlamaSampler::greedy(),
             utf8_buf,
-            text: String::new(),
-            pending_token: None,
-            prompt_phase: false,
-            resp: None,
-            token_tx: None,
-            done_tx: None,
-            cache_tokens: vec![],
+            ..base_slot()
         }
     }
 
@@ -1244,20 +1402,8 @@ mod tests {
     fn test_slot_cancel_sends_error_through_resp() {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let mut slot = Slot {
-            prompt_tokens: vec![],
-            n_prompt: 0,
-            gen_count: 0,
-            max_tokens: 10,
-            kv_pos: 0,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
-            text: String::new(),
-            pending_token: None,
-            prompt_phase: false,
             resp: Some(resp_tx),
-            token_tx: None,
-            done_tx: None,
-            cache_tokens: vec![],
+            ..base_slot()
         };
         slot.cancel(LlamaError::Inference("test error".into()));
         let err = resp_rx.blocking_recv().unwrap().unwrap_err();
@@ -1265,26 +1411,11 @@ mod tests {
     }
 
     #[test]
-    fn test_slot_emit_returns_false_on_disconnect() {
+    fn test_slot_push_text_reports_disconnect() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(rx);
-        let mut slot = Slot {
-            prompt_tokens: vec![],
-            n_prompt: 0,
-            gen_count: 0,
-            max_tokens: 10,
-            kv_pos: 0,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
-            text: String::new(),
-            pending_token: None,
-            prompt_phase: false,
-            resp: None,
-            token_tx: Some(tx),
-            done_tx: None,
-            cache_tokens: vec![],
-        };
-        assert!(!slot.emit("lost"));
+        let mut slot = streaming_slot(tx, &[]);
+        assert_eq!(slot.push_text("lost"), Emit::Disconnected);
     }
 
     #[test]
@@ -1293,37 +1424,13 @@ mod tests {
         let (resp_tx2, resp_rx2) = tokio::sync::oneshot::channel();
         let mut slots: Vec<Option<Slot>> = vec![
             Some(Slot {
-                prompt_tokens: vec![],
-                n_prompt: 0,
-                gen_count: 0,
-                max_tokens: 10,
-                kv_pos: 0,
-                sampler: LlamaSampler::greedy(),
-                utf8_buf: vec![],
-                text: String::new(),
-                pending_token: None,
-                prompt_phase: false,
                 resp: Some(resp_tx1),
-                token_tx: None,
-                done_tx: None,
-                cache_tokens: vec![],
+                ..base_slot()
             }),
             None,
             Some(Slot {
-                prompt_tokens: vec![],
-                n_prompt: 0,
-                gen_count: 0,
-                max_tokens: 10,
-                kv_pos: 0,
-                sampler: LlamaSampler::greedy(),
-                utf8_buf: vec![],
-                text: String::new(),
-                pending_token: None,
-                prompt_phase: false,
                 resp: Some(resp_tx2),
-                token_tx: None,
-                done_tx: None,
-                cache_tokens: vec![],
+                ..base_slot()
             }),
         ];
         let mut slot_cache: Vec<Vec<LlamaToken>> = vec![
@@ -1347,20 +1454,13 @@ mod tests {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let mut slot = Slot {
-            prompt_tokens: vec![],
             n_prompt: 3,
             gen_count: 5,
-            max_tokens: 10,
             kv_pos: 5,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
             text: "hello world".into(),
-            pending_token: None,
-            prompt_phase: false,
             resp: Some(resp_tx),
-            token_tx: None,
             done_tx: Some(done_tx),
-            cache_tokens: vec![],
+            ..base_slot()
         };
         slot.finish();
         let via_resp = resp_rx.blocking_recv().unwrap().unwrap();
@@ -1375,32 +1475,164 @@ mod tests {
     fn test_slot_cancel_sends_error_through_done_tx() {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let mut slot = Slot {
-            prompt_tokens: vec![],
-            n_prompt: 0,
-            gen_count: 0,
-            max_tokens: 10,
-            kv_pos: 0,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
-            text: String::new(),
-            pending_token: None,
-            prompt_phase: false,
-            resp: None,
-            token_tx: None,
             done_tx: Some(done_tx),
-            cache_tokens: vec![],
+            ..base_slot()
         };
         slot.cancel(LlamaError::Inference("test error".into()));
         let err = done_rx.blocking_recv().unwrap().unwrap_err();
         assert!(matches!(err, LlamaError::Inference(_)));
     }
 
+    // ── stop sequences ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stop_sequence_within_a_single_fragment() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["STOP"]);
+        assert_eq!(slot.push_text("abcSTOPdef"), Emit::Stopped);
+        // The stop text and everything after it is dropped from the result.
+        assert_eq!(slot.text, "abc");
+        assert_eq!(drain(&mut rx), "abc");
+    }
+
+    #[test]
+    fn test_stop_sequence_split_across_fragments() {
+        // The case a per-token check cannot catch: no single fragment
+        // contains the stop sequence, only their concatenation does.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["<|end|>"]);
+        assert_eq!(slot.push_text("hello <|"), Emit::Continue);
+        assert_eq!(slot.push_text("end"), Emit::Continue);
+        assert_eq!(slot.push_text("|>tail"), Emit::Stopped);
+        assert_eq!(slot.text, "hello ");
+        assert_eq!(drain(&mut rx), "hello ");
+    }
+
+    #[test]
+    fn test_partial_stop_match_is_withheld_then_released() {
+        // "<|" looks like the start of the stop sequence, so it must not be
+        // streamed. When the next fragment rules the match out, the withheld
+        // bytes are released — losing them would silently truncate output.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["<|end|>"]);
+        assert_eq!(slot.push_text("hi <|"), Emit::Continue);
+        assert_eq!(drain(&mut rx), "hi ", "the ambiguous tail must be held");
+        assert_eq!(slot.push_text("not"), Emit::Continue);
+        assert_eq!(drain(&mut rx), "<|not", "ruled out, so released");
+        assert_eq!(slot.text, "hi <|not");
+    }
+
+    #[test]
+    fn test_no_stop_sequences_withholds_nothing() {
+        // The default path must not pay any streaming latency.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &[]);
+        slot.push_text("anything at all");
+        assert_eq!(drain(&mut rx), "anything at all");
+        assert_eq!(slot.holdback(), 0);
+    }
+
+    #[test]
+    fn test_unrelated_text_is_not_withheld_despite_stop_sequences() {
+        // Hold-back is computed from the actual tail, not from stop_max_len,
+        // so output that looks nothing like a stop streams immediately.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["<|end|>"]);
+        slot.push_text("plain prose");
+        assert_eq!(drain(&mut rx), "plain prose");
+    }
+
+    #[test]
+    fn test_earliest_of_several_stop_sequences_wins() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["END", "XY"]);
+        assert_eq!(slot.push_text("aXYbENDc"), Emit::Stopped);
+        // "XY" occurs before "END": the cut is the earliest match, not the
+        // first stop sequence in list order.
+        assert_eq!(slot.text, "a");
+    }
+
+    #[test]
+    fn test_stop_sequence_at_the_very_start_yields_empty_text() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["STOP"]);
+        assert_eq!(slot.push_text("STOP"), Emit::Stopped);
+        assert_eq!(slot.text, "");
+    }
+
+    #[test]
+    fn test_stop_matching_across_multibyte_characters() {
+        // Hold-back offsets are byte counts; landing mid-character would panic
+        // on the `str` slice. "é" is two bytes, so the naive offset is unsafe.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["éé"]);
+        assert_eq!(slot.push_text("café"), Emit::Continue);
+        assert_eq!(slot.push_text("é!"), Emit::Stopped);
+        assert_eq!(slot.text, "caf");
+        assert_eq!(drain(&mut rx), "caf");
+    }
+
+    #[test]
+    fn test_multibyte_tail_is_not_split_when_withheld() {
+        // A withheld tail must stay on a char boundary even when the stop
+        // sequence is multi-byte and only partially matched.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = streaming_slot(tx, &["→→"]);
+        assert_eq!(slot.push_text("go →"), Emit::Continue);
+        assert_eq!(drain(&mut rx), "go ");
+        assert_eq!(slot.push_text(" on"), Emit::Continue);
+        assert_eq!(drain(&mut rx), "→ on");
+    }
+
+    #[test]
+    fn test_finish_releases_withheld_tail() {
+        // Generation ending on EOG or the token cap while a partial stop match
+        // is outstanding must still deliver those bytes.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let mut slot = Slot {
+            done_tx: Some(done_tx),
+            ..streaming_slot(tx, &["<|end|>"])
+        };
+        assert_eq!(slot.push_text("done <|"), Emit::Continue);
+        assert_eq!(drain(&mut rx), "done ");
+        slot.finish();
+        assert_eq!(drain(&mut rx), "<|", "withheld tail must be flushed");
+        assert_eq!(done_rx.blocking_recv().unwrap().unwrap().text, "done <|");
+    }
+
+    #[test]
+    fn test_stop_sequence_without_streaming_client_still_truncates() {
+        // Non-streaming requests have no token_tx; the stop logic must work
+        // off `text` alone.
+        let mut slot = Slot {
+            stop: vec!["STOP".to_owned()],
+            stop_max_len: 4,
+            ..base_slot()
+        };
+        assert_eq!(slot.push_text("keepSTOPdrop"), Emit::Stopped);
+        assert_eq!(slot.text, "keep");
+    }
+
     // ── sampler chain ─────────────────────────────────────────────────────
+
+    /// The model-card defaults, as `resolve_sampling` produces them for a
+    /// request that overrides nothing.
+    fn default_params() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.1,
+            top_k: 50,
+            top_p: 0.95,
+            repeat_penalty: 1.05,
+            repeat_last_n: -1,
+            seed: crate::protocol::RANDOM_SEED,
+        }
+    }
 
     #[test]
     fn test_sampler_chain_content_and_order_for_temperature() {
         assert_eq!(
-            sampler_chain(0.1),
+            sampler_chain(default_params()),
             vec![
                 SamplerKind::Penalties {
                     penalty_last_n: -1,
@@ -1412,28 +1644,85 @@ mod tests {
                     min_keep: 1
                 },
                 SamplerKind::Temp { t: 0.1 },
-                SamplerKind::Dist { seed: 0 },
+                SamplerKind::Dist {
+                    seed: crate::protocol::RANDOM_SEED
+                },
             ]
         );
     }
 
     #[test]
+    fn test_sampler_chain_threads_every_parameter_through() {
+        // Regression guard for hardcoding: each field must reach its sampler.
+        // These values are deliberately unlike the defaults, so a chain that
+        // ignored the argument would fail on every element.
+        let params = SamplingParams {
+            temperature: 1.5,
+            top_k: 7,
+            top_p: 0.3,
+            repeat_penalty: 1.9,
+            repeat_last_n: 64,
+            seed: 12345,
+        };
+        assert_eq!(
+            sampler_chain(params),
+            vec![
+                SamplerKind::Penalties {
+                    penalty_last_n: 64,
+                    penalty_repeat: 1.9,
+                },
+                SamplerKind::TopK { k: 7 },
+                SamplerKind::TopP {
+                    p: 0.3,
+                    min_keep: 1
+                },
+                SamplerKind::Temp { t: 1.5 },
+                SamplerKind::Dist { seed: 12345 },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sampler_chain_default_seed_is_the_random_sentinel() {
+        // The defect this guards: a fixed seed makes every request with the
+        // same prompt return identical text, so `temperature` has no
+        // observable effect across requests. Each slot builds its own sampler,
+        // so the sentinel is the only thing that varies them.
+        let chain = sampler_chain(default_params());
+        assert!(matches!(
+            chain.last(),
+            Some(SamplerKind::Dist { seed }) if *seed == crate::protocol::RANDOM_SEED
+        ));
+    }
+
+    #[test]
     fn test_sampler_chain_zero_or_negative_temperature_means_greedy() {
-        assert_eq!(sampler_chain(0.0), vec![]);
-        assert_eq!(sampler_chain(-0.5), vec![]);
+        let zero = SamplingParams {
+            temperature: 0.0,
+            ..default_params()
+        };
+        let negative = SamplingParams {
+            temperature: -0.5,
+            ..default_params()
+        };
+        assert_eq!(sampler_chain(zero), vec![]);
+        assert_eq!(sampler_chain(negative), vec![]);
     }
 
     #[test]
     fn test_build_sampler_chain_branch_constructs() {
         // Smoke: the FFI chain construction for every sampler kind (the
         // greedy branch is already exercised by the slot tests above).
-        let sampler = build_sampler(0.1);
+        let sampler = build_sampler(default_params());
         drop(sampler);
     }
 
     #[test]
     fn test_build_sampler_greedy_branch_constructs() {
-        let sampler = build_sampler(0.0);
+        let sampler = build_sampler(SamplingParams {
+            temperature: 0.0,
+            ..default_params()
+        });
         drop(sampler);
     }
 
@@ -1564,20 +1853,8 @@ mod tests {
 
     fn slot_for_request() -> Slot {
         Slot {
-            prompt_tokens: vec![],
-            n_prompt: 0,
-            gen_count: 0,
-            max_tokens: 10,
-            kv_pos: 0,
-            sampler: LlamaSampler::greedy(),
-            utf8_buf: vec![],
-            text: String::new(),
-            pending_token: None,
             prompt_phase: true,
-            resp: None,
-            token_tx: None,
-            done_tx: None,
-            cache_tokens: vec![],
+            ..base_slot()
         }
     }
 

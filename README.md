@@ -40,7 +40,7 @@ fully released. Teardown is bounded by one decode step even when every slot is
 busy — a shutdown flag is checked per loop iteration, not just when the command
 channel is drained.
 
-**Slot lifecycle**: `empty → prefill (prompt phase) → generate → finish/cancel → empty`.
+**Slot lifecycle**: `empty → prefill (prompt phase) → generate → finish/cancel → empty`. A slot finishes on end-of-generation, the token cap, the per-slot budget, or a stop sequence.
 - Each slot has a per-slot token budget (`N_CTX / N_SLOTS`, default 2048 — one slot holding all of `N_CTX`), configurable via `LLAMAD_N_CTX` / `LLAMAD_N_SLOTS`. A prompt that exceeds its slot's budget is rejected at preprocess time rather than truncated.
 - When all `LLAMAD_N_SLOTS` slots are full, new requests queue in the `mpsc` channel and are dequeued as slots free up.
 - **Slot routing is prefix-aware**: an incoming request goes to the free slot whose retained KV prefix shares the most tokens with it, not simply to the lowest free index. Without this, a request arriving while slot 0 is busy would full-prefill on slot 1 even when an idle slot held an exact prefix of it — the common shape for a repeated system prompt. Ties resolve to the lowest free index.
@@ -60,7 +60,7 @@ src/
 ├── client.rs      High-level Client API, TokenStream (sync + async)
 ├── config.rs      InferenceConfig, LLAMAD_* env knobs, sane() clamping
 ├── protocol.rs    Request/Response types, LlamaError, InferCmd
-├── preprocess.rs  Chat template + tokenization offload, build_messages, clamp_temperature
+├── preprocess.rs  Chat template + tokenization offload, sampling resolution, stop normalization
 ├── inference.rs   Engine, slotted inference loop, Slot lifecycle, inference_loop()
 ├── server.rs      Unix socket server (JSON/NDJSON over UDS)
 └── main.rs        Daemon entry point (requires the `bin` feature, on by default)
@@ -123,6 +123,8 @@ let result = client.complete(
         .with_system("answer concisely")
         .with_temperature(0.3)
         .with_max_tokens(200)
+        .with_seed(42)              // omit for a fresh random seed per request
+        .push_stop("\n\n")          // ends generation, excluded from the result
         .push_history("user", "previous question"),
 )?;
 
@@ -178,7 +180,7 @@ its argument-handling and log-subscriber dependencies.
 One request per connection: write a JSON object, half-close the write side,
 read the reply.
 
-Fields: `prompt` (required), `system`, `max_tokens` (default 256), `temperature` (clamped [0,2]), `stream` (bool), `history` (`[{role, content}]`). Unknown fields rejected. Request bodies are capped at 1 MiB (`server::MAX_REQUEST_BYTES`).
+Fields: `prompt` (required), `system`, `max_tokens`, `temperature`, `top_k`, `top_p`, `repeat_penalty`, `repeat_last_n`, `seed`, `stop` (`[string]`), `stream` (bool), `history` (`[{role, content}]`). See [Generation parameters](#generation-parameters) for defaults and ranges. Unknown fields rejected. Request bodies are capped at 1 MiB (`server::MAX_REQUEST_BYTES`).
 
 `Request` and `Response` both implement `Serialize` and `Deserialize`, so a
 Rust consumer of the socket protocol can use the crate's own types rather than
@@ -275,15 +277,57 @@ Both models share the same architecture (LFM2.5 dense hybrid), chat template (Ch
 
 ## Generation parameters
 
-Defaults match the Liquid AI recommended settings from the model card:
+Every sampling parameter is per-request and overridable. The **defaults** match
+the Liquid AI recommended settings from the LFM2.5 model card — they are a
+starting point for the bundled models, not a policy imposed on every GGUF:
 
-- `temperature`: 0.1
-- `top_k`: 50
-- `repetition_penalty`: 1.05
-- `top_p`: 0.95
-- Sampler chain: penalties → top-k → top-p → temperature → distribution
+| Field | Default | Range |
+|---|---|---|
+| `temperature` | 0.1 | clamped `[0, 2]`; `<= 0` selects greedy decoding |
+| `top_k` | 50 | clamped `>= 0`; `0` disables |
+| `top_p` | 0.95 | clamped `[0, 1]` |
+| `repeat_penalty` | 1.05 | clamped `[0, 2]`; `1.0` disables |
+| `repeat_last_n` | -1 (whole context) | clamped `>= -1`; `0` disables the lookback |
+| `seed` | a fresh random seed per request | any `u32` |
+| `max_tokens` | 256 | further capped by the per-slot budget |
 
-When `temperature` is set to 0.0 or below, a greedy sampler is used instead.
+Sampler chain: penalties → top-k → top-p → temperature → distribution. When
+`temperature <= 0` a greedy sampler replaces the chain entirely, and the other
+sampling fields do not apply.
+
+Unparsable or out-of-range values are clamped rather than rejected; `NaN`
+floats fall back to the default.
+
+### Seeding
+
+`seed` defaults to a **fresh random seed per request**, so two identical
+requests at a non-zero temperature produce different text. Pin it for
+reproducible output:
+
+```rust
+let req = Request::new("invent a sentence")
+    .with_temperature(1.0)
+    .with_seed(42);            // same text every run
+```
+
+Greedy decoding (`temperature <= 0`) is deterministic regardless and ignores
+the seed.
+
+### Stop sequences
+
+Generation ends as soon as any stop sequence appears in the output. The matched
+text is excluded from the result and is never streamed:
+
+```rust
+let req = Request::new("emit a tool call")
+    .push_stop("<|tool_call_end|>")
+    .push_stop("\n\n");
+```
+
+A stop sequence may span token boundaries — output that could still grow into
+one is withheld from the stream until the match either completes or is ruled
+out, so a partial match never leaks to the client. Text that looks nothing like
+a stop sequence streams with no added latency. Empty stop strings are ignored.
 
 ## Performance notes
 
@@ -359,7 +403,7 @@ cargo test --test reuse               # KV-prefix-reuse path tests (attention mo
 cargo test --test cancellation        # slot-recycling cancellation test
 ```
 
-111 unit tests + 20 real-model tests (11 in `tests/integration.rs`, 5 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 4 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
+141 unit tests + 24 real-model tests (15 in `tests/integration.rs`, 5 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 4 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
 
 ### KV-reuse path (`LLAMAD_TEST_MODEL` / bundled SmolLM2)
 
@@ -370,12 +414,12 @@ The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages o
 | Area | Tests | Description |
 |---|---|---|
 | Protocol | 17 | Deserialization, serialization round-trip, null-byte rejection, history |
-| Preprocess | 19 | Chat templating (`build_messages`), temperature clamping, budget checks, defaults |
-| Slot lifecycle + KV reuse | 32 | emit, finish, cancel, streaming disconnect, UTF-8 assembly, sampler chain, LCP, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
+| Preprocess | 29 | Chat templating (`build_messages`), sampling resolution and clamping, stop-sequence normalization, budget checks, defaults |
+| Slot lifecycle + KV reuse | 52 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
 | Client API | 15 | complete/complete_stream, async variants, error propagation, done-signal ordering, `Send + Sync` guard |
 | Server | 15 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, size cap, error responses |
 | Config | 13 | Env parsing, defaults, `sane()` clamping, true-spelling flip-from-disabled |
-| Integration | 11 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly) |
+| Integration | 15 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility |
 | Lifecycle | 5 | Real model: two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
 | KV reuse e2e | 3 | Real model (attention, `tests/reuse.rs`): identical resend, partial-prefix triple, reuse-engages probe verdict |
 | Cancellation | 1 | Single-slot server: slot recycled after stream drop (bounded first-token wait) |

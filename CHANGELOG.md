@@ -27,7 +27,9 @@ First public release. Everything below is new.
   drop, so releasing an engine cancels in-flight requests and returns only
   once the model is actually freed. Engines are independent: several can be
   alive at once, each with its own model.
-- `Request` builder with system prompt, history, temperature and token cap.
+- `Request` builder with system prompt, history, token cap, stop sequences and
+  the full sampling set (temperature, top-k, top-p, repetition penalty and its
+  lookback, seed).
   `Request`, `Response` and `TokenChunk` all round-trip through serde, so a
   Rust consumer of the socket protocol uses these types rather than
   hand-rolled JSON.
@@ -56,11 +58,23 @@ First public release. Everything below is new.
   under concurrency. Ties resolve to the lowest free index.
 - Preprocess offload: chat templating and tokenization run on a dedicated
   thread, so a long prompt never stalls in-flight generations.
+- Per-request sampling: `temperature`, `top_k`, `top_p`, `repeat_penalty`,
+  `repeat_last_n` and `seed` are all set per request. The defaults are the
+  Liquid AI model-card values, but they are defaults only — a crate that loads
+  arbitrary GGUFs must not impose one vendor's recommendation. Values are
+  clamped into range rather than rejected, and `NaN` falls back to the default.
+- `seed` defaults to a fresh random seed per request, so two identical requests
+  at a non-zero temperature return different text. Pin it for reproducibility.
+- Stop sequences: `stop` ends generation as soon as any entry appears, and the
+  matched text is excluded from the result. A stop sequence may span token
+  boundaries — output that could still grow into one is withheld from the
+  stream until the match completes or is ruled out, so a partial match never
+  leaks to a streaming client. Text unlike any stop sequence streams with no
+  added latency.
 - Per-slot token budgets, incremental UTF-8 assembly across token boundaries,
   and cancellation that frees a slot as soon as a streaming client goes away.
-- Sampler chain matching the Liquid AI recommended settings
-  (penalties → top-k → top-p → temperature → distribution), with greedy
-  decoding at temperature ≤ 0.
+- Sampler chain order: penalties → top-k → top-p → temperature →
+  distribution, replaced entirely by a greedy sampler at temperature ≤ 0.
 
 **Daemon**
 
@@ -95,5 +109,5 @@ First public release. Everything below is new.
 
 - Tested against the Liquid AI LFM2.5 family; KV-prefix reuse additionally
   exercised against pure-attention models (SmolLM2, Qwen2.5).
-- 111 unit tests, 20 real-model tests, 4 doc tests. CI runs clippy and
+- 141 unit tests, 24 real-model tests, 4 doc tests. CI runs clippy and
   rustdoc at `-D warnings`.

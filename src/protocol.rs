@@ -77,9 +77,41 @@ pub struct Request {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Sampling temperature, clamped to `[0, 2]`. Defaults to 0.1. Zero or
-    /// below selects greedy decoding.
+    /// below selects greedy decoding, which ignores every other sampling
+    /// field below except `seed` (which greedy decoding does not consult).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Top-k cutoff. Clamped to `>= 0`; `0` disables it. Defaults to 50.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    /// Nucleus-sampling threshold, clamped to `[0, 1]`. Defaults to 0.95.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Repetition penalty, clamped to `[0, 2]`. `1.0` disables it. Defaults
+    /// to 1.05.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f32>,
+    /// How many recent tokens the repetition penalty looks back over. `-1`
+    /// (the default) means the whole context; `0` disables the lookback.
+    /// Clamped to `>= -1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_last_n: Option<i32>,
+    /// RNG seed for sampling.
+    ///
+    /// Defaults to a **fresh random seed per request**, so two identical
+    /// requests at a non-zero temperature produce different text. Set it
+    /// explicitly for reproducible output. Ignored by greedy decoding
+    /// (`temperature <= 0`), which is deterministic regardless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    /// Strings that end generation as soon as one appears in the output.
+    ///
+    /// The matched stop text is **not** included in the returned completion,
+    /// and is never streamed: output that could still grow into a stop
+    /// sequence is held back until the match resolves. Empty strings are
+    /// ignored. A stop sequence may span token boundaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
     /// Stream tokens as NDJSON instead of returning one JSON object. Only
     /// meaningful over the socket protocol; the in-process client selects
     /// streaming by calling [`Client::complete_stream`](crate::client::Client::complete_stream).
@@ -162,6 +194,58 @@ impl Request {
         self
     }
 
+    /// Set the top-k cutoff. `0` disables it.
+    #[must_use]
+    pub fn with_top_k(mut self, top_k: i32) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Set the nucleus-sampling threshold. Clamped to `[0, 1]`.
+    #[must_use]
+    pub fn with_top_p(mut self, top_p: f32) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    /// Set the repetition penalty. `1.0` disables it.
+    #[must_use]
+    pub fn with_repeat_penalty(mut self, penalty: f32) -> Self {
+        self.repeat_penalty = Some(penalty);
+        self
+    }
+
+    /// Set how many recent tokens the repetition penalty considers. `-1` is
+    /// the whole context, `0` disables the lookback.
+    #[must_use]
+    pub fn with_repeat_last_n(mut self, last_n: i32) -> Self {
+        self.repeat_last_n = Some(last_n);
+        self
+    }
+
+    /// Pin the sampling seed for reproducible output. Without this each
+    /// request draws a fresh random seed.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u32) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Replace the stop sequences. Generation ends as soon as one appears,
+    /// and the matched text is excluded from the completion.
+    #[must_use]
+    pub fn with_stop(mut self, stop: Vec<String>) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    /// Append one stop sequence.
+    #[must_use]
+    pub fn push_stop(mut self, stop: impl Into<String>) -> Self {
+        self.stop.push(stop.into());
+        self
+    }
+
     /// Set the `stream` flag of the socket protocol.
     #[must_use]
     pub fn with_stream(mut self, stream: bool) -> Self {
@@ -219,20 +303,45 @@ pub enum InferCmd {
     Shutdown,
 }
 
+/// llama.cpp's "draw a fresh random seed" sentinel — `LLAMA_DEFAULT_SEED` in
+/// `llama.h`. `llama_sampler_init_dist` maps it through `get_rng_seed`, which
+/// pulls from `std::random_device` (or the system clock when that is not a
+/// true RNG). Defined here rather than taken from the bindgen output so the
+/// value does not depend on how the sys crate happens to name its constants.
+pub(crate) const RANDOM_SEED: u32 = 0xFFFF_FFFF;
+
+/// Sampling parameters resolved from a [`Request`]: every `None` replaced by
+/// its default and every value clamped into a usable range.
+///
+/// Separate from `Request` so the inference thread receives values it can
+/// hand to llama.cpp unchecked — validation happens once, on the preprocess
+/// thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SamplingParams {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: i32,
+    pub seed: u32,
+}
+
 /// A fully-prepared inference command: the prompt is already templated,
-/// tokenized, and budget-checked. Sent from the preprocess thread to the
-/// inference thread.
+/// tokenized, and budget-checked, and the sampling parameters are resolved
+/// and clamped. Sent from the preprocess thread to the inference thread.
 pub(crate) enum PreparedCmd {
     Run {
         tokens: Vec<LlamaToken>,
         max_gen: u32,
-        temperature: f32,
+        sampling: SamplingParams,
+        stop: Vec<String>,
         resp: oneshot::Sender<Result<InferResult, LlamaError>>,
     },
     RunStream {
         tokens: Vec<LlamaToken>,
         max_gen: u32,
-        temperature: f32,
+        sampling: SamplingParams,
+        stop: Vec<String>,
         token_tx: tokio::sync::mpsc::UnboundedSender<String>,
         done_tx: Option<tokio::sync::oneshot::Sender<Result<InferResult, LlamaError>>>,
     },
