@@ -5,7 +5,11 @@
 //!
 //! The transport is a Unix domain socket on Unix and a named pipe on Windows;
 //! the protocol above is identical on both. The handlers are generic over the
-//! stream, so only [`bind_socket`] / [`bind_pipe`] differ by platform.
+//! stream, so only the listener differs by platform: `bind_socket` on Unix,
+//! `bind_pipe` on Windows.
+//!
+//! Those two are deliberately *not* intra-doc links — each exists on only one
+//! platform, so linking either one breaks `cargo doc` on the other.
 //!
 //! # Why a newline terminates a request
 //!

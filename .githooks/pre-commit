@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Runs the checks that CI's `check` job runs, before the commit exists.
+#
+# Install once:   git config core.hooksPath .githooks
+#
+# Scope is deliberate: everything here finishes in seconds on a warm target
+# directory. The real-model suite (~1.4 GB of GGUFs) and the cross-platform
+# jobs are not run — those belong in CI, and a hook slow enough to be annoying
+# is a hook people bypass.
+#
+# Escape hatch: `git commit --no-verify`. Use it for work-in-progress commits
+# on a branch, not for anything you are about to push to main.
+set -uo pipefail
+
+# Only check the crate, not whatever directory the commit was invoked from.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+fail=0
+run() {
+    local label="$1"
+    shift
+    printf '  %-28s' "$label"
+    if out=$("$@" 2>&1); then
+        printf 'ok\n'
+    else
+        printf 'FAILED\n'
+        printf '%s\n' "$out" | sed 's/^/    /'
+        fail=1
+    fi
+}
+
+echo "pre-commit:"
+
+# Ordered cheapest-first so an obvious formatting slip fails in under a second
+# rather than after a clippy build.
+run "cargo fmt --check"     cargo fmt --check --all
+run "cargo clippy"          cargo clippy --all-targets -- -D warnings
+
+# `cargo doc` is here because it is the one check that has actually caught a
+# real problem late: an intra-doc link to a cfg-gated item resolves on the
+# platform that defines it and breaks everywhere else, which fmt, clippy and
+# the tests all pass straight through.
+run "cargo doc"             env RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --quiet
+
+# `--lib` and `--doc` cannot be combined; both are fast without a model.
+run "cargo test --lib"      cargo test --lib --quiet
+run "cargo test --doc"      cargo test --doc --quiet
+
+# Compiling the real-model binaries catches an API change that breaks them
+# without needing any GGUF present.
+run "cargo test --no-run"   cargo test --no-run --all-targets --quiet
+
+if [ "$fail" -ne 0 ]; then
+    echo
+    echo "pre-commit failed. Fix the above, or bypass with: git commit --no-verify"
+    exit 1
+fi
+
+echo "pre-commit: all checks passed"

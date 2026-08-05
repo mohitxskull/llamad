@@ -728,6 +728,32 @@ cargo clippy --all-targets -- -D warnings
 cargo test --features native
 ```
 
+## Development
+
+Enable the pre-commit hook once per clone — `core.hooksPath` is local config,
+so it does not come with the repository:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-commit` runs the same checks as CI's `check` job — rustfmt,
+clippy at `-D warnings`, rustdoc at `-D warnings`, unit tests, doc tests, and a
+compile of the real-model test binaries. About 12 seconds on a warm `target/`,
+and no model files needed.
+
+`cargo doc` is in there for a specific reason: an intra-doc link to a
+`cfg`-gated item resolves fine on the platform that defines it and fails
+everywhere else, and fmt, clippy and the tests all pass straight through that.
+It is the one check that has caught a problem nothing else did.
+
+What the hook deliberately does *not* run: the real-model suite (needs ~1.4 GB
+of GGUFs) and the macOS/Windows jobs. Those belong in CI. A hook slow enough to
+be irritating is a hook people bypass.
+
+Bypass with `git commit --no-verify` for work-in-progress commits on a branch —
+not for anything about to reach `main`.
+
 ## Releasing
 
 Changelog and release notes come from [git-cliff](https://git-cliff.org)
