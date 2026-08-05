@@ -8,7 +8,7 @@ Entries below the first release heading are generated from
 [Conventional Commits](https://www.conventionalcommits.org/) by
 [git-cliff](https://git-cliff.org) — see "Releasing" in the README.
 
-## [Unreleased]
+## [0.1.0] - 2026-08-05
 
 First public release. Everything below is new.
 

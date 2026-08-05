@@ -202,11 +202,50 @@ sustained, split the cores. Measure on your own hardware before assuming —
 these numbers are one CPU, two small models, and do not extrapolate to a
 16-core box.
 
-Models stay resident for as long as their client is alive. There is no registry,
-no lazy loading and no eviction: dropping a client unloads its model and joins
-its threads. If you need many models but not all at once, drop and reconstruct —
-loading a small quantized GGUF is fast, and a `Client` is cheap to hold behind
-an `Option`.
+A runnable version of all this is in
+[`examples/multi_model.rs`](examples/multi_model.rs):
+
+```
+cargo run --release --example multi_model -- router.gguf thinker.gguf "your prompt"
+```
+
+#### Lazy loading, and why there is no registry
+
+Models stay resident for as long as their client is alive. There is deliberately
+no registry, no lazy loading and no eviction in the crate: dropping a client
+unloads its model and joins its threads, and that is the whole lifecycle.
+
+Eviction is the reason. Any registry worth the name eventually unloads
+something, which means some later request stalls for however long it takes to
+read a GGUF back off disk — at a moment neither you nor your user chose. For a
+CLI tool or an editor integration that is a worse failure than running out of
+memory, because it is silent and intermittent. That policy belongs to the
+application, which knows which model must never be evicted.
+
+Lazy loading without the eviction policy is about fifteen lines, and you keep
+control of when the model goes away:
+
+```rust
+use std::sync::Mutex;
+
+struct Lazy { path: String, config: InferenceConfig, slot: Mutex<Option<Client>> }
+
+impl Lazy {
+    fn with<R>(&self, f: impl FnOnce(&Client) -> R) -> Result<R, LlamaError> {
+        let mut guard = self.slot.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(Client::with_config(&self.path, self.config.clone())?);
+        }
+        Ok(f(guard.as_ref().expect("just loaded")))
+    }
+
+    /// Release the memory. The next `with` reloads.
+    fn unload(&self) { drop(self.slot.lock().unwrap().take()); }
+}
+```
+
+Loading a small quantized GGUF takes on the order of a second, so reconstructing
+on demand is viable when you genuinely cannot hold everything at once.
 
 ### Design tradeoffs
 
@@ -579,6 +618,13 @@ Environment variables (read once per engine at startup; unparsable values fall b
 | `LLAMAD_N_THREADS` | physical cores | Threads for single-token decode (clamped 1–256) |
 | `LLAMAD_N_THREADS_BATCH` | physical cores | Threads for batched prompt processing, prefill (clamped 1–256) |
 | `LLAMAD_KV_CACHE` | on | Reuse the KV prefix of completed sequences on the next request into the same slot (runtime-probed; disabled on models that cannot partially rewind KV; retention capped at the per-slot budget — sequences at/over the budget are fully cleared) |
+
+## Examples
+
+| Example | What it shows |
+|---|---|
+| [`bench.rs`](examples/bench.rs) | TTFT and decode throughput for one model. `cargo run --release --example bench -- <model.gguf> <n_repeat> [system_prompt]` |
+| [`multi_model.rs`](examples/multi_model.rs) | A small router plus a large thinker in one process: per-model config, grammar-constrained routing, and lazy loading. `cargo run --release --example multi_model -- <router.gguf> <thinker.gguf> [prompt]` |
 
 ## Tests
 
