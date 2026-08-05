@@ -20,7 +20,7 @@ jobs:
     # long build — an actual timeout here means something is stuck.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -83,7 +83,7 @@ jobs:
       # Pull requests restore this from main's cache; their own entries are
       # discarded when the PR closes.
       - name: Cache GGUF fixtures
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: models/*.gguf
           key: gguf-${{ hashFiles('models/download.sh') }}
@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read rust-version from Cargo.toml
         id: msrv
