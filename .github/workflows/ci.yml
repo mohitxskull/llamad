@@ -113,5 +113,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `--lib --bins`, not `--all-targets`: the MSRV is a promise about what a
+      # consumer can build, and a consumer never builds our dev-dependencies.
+      # `--all-targets` pulls in the test harness (serial_test 4 needs rustc
+      # 1.93), which would force the declared MSRV up to satisfy a crate that
+      # is never shipped. The library and the daemon binary — the things people
+      # actually depend on — do build on 1.88.
       - name: Check against the declared MSRV
-        run: cargo check --all-targets
+        run: cargo check --lib --bins

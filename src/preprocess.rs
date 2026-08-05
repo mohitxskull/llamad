@@ -62,7 +62,10 @@ pub(crate) fn resolve_sampling(request: &Request) -> SamplingParams {
         top_p: resolve_f32(request.top_p, DEFAULT_TOP_P, 0.0, 1.0),
         repeat_penalty: resolve_f32(request.repeat_penalty, DEFAULT_REPEAT_PENALTY, 0.0, 2.0),
         // -1 means "the whole context"; anything below that is meaningless.
-        repeat_last_n: request.repeat_last_n.unwrap_or(DEFAULT_REPEAT_LAST_N).max(-1),
+        repeat_last_n: request
+            .repeat_last_n
+            .unwrap_or(DEFAULT_REPEAT_LAST_N)
+            .max(-1),
         // No seed means a fresh random one per request, so two identical
         // requests at a non-zero temperature do not return identical text.
         seed: request.seed.unwrap_or(RANDOM_SEED),
@@ -207,15 +210,13 @@ pub(super) fn preprocess_loop(
     for cmd in cmd_rx {
         match cmd {
             InferCmd::Run { request, resp } => match prepare_request(&model, &request, budget) {
-                Ok(req) => {
-                    match prepared_tx.send(PreparedCmd::Run { req, resp }) {
-                        Ok(()) => {}
-                        Err(mpsc::SendError(PreparedCmd::Run { resp, .. })) => {
-                            let _ = resp.send(Err(LlamaError::InferenceCrashed));
-                        }
-                        Err(_) => unreachable!("Run arm can only fail with Run"),
+                Ok(req) => match prepared_tx.send(PreparedCmd::Run { req, resp }) {
+                    Ok(()) => {}
+                    Err(mpsc::SendError(PreparedCmd::Run { resp, .. })) => {
+                        let _ = resp.send(Err(LlamaError::InferenceCrashed));
                     }
-                }
+                    Err(_) => unreachable!("Run arm can only fail with Run"),
+                },
                 Err(e) => {
                     let _ = resp.send(Err(e));
                 }

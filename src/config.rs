@@ -99,9 +99,7 @@ impl InferenceConfig {
             // to `n_ctx`, and llama.cpp hard-asserts `n_tokens_all <= n_batch`
             // inside `llama_context::decode`. A smaller context would abort the
             // process on the startup KV-rewind probe, before any request ran.
-            n_ctx: self
-                .n_ctx
-                .clamp((n_slots as u32).max(MIN_N_CTX), 1_048_576),
+            n_ctx: self.n_ctx.clamp((n_slots as u32).max(MIN_N_CTX), 1_048_576),
             n_threads: self.n_threads.clamp(1, 256),
             n_threads_batch: self.n_threads_batch.clamp(1, 256),
             kv_cache: self.kv_cache,

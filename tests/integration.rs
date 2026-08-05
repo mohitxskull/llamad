@@ -385,10 +385,12 @@ ws     ::= " "?
         )
         .expect("json grammar completion");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(result.text.trim()).unwrap_or_else(|e| {
-            panic!("grammar output {:?} did not parse as JSON: {e}", result.text)
-        });
+    let parsed: serde_json::Value = serde_json::from_str(result.text.trim()).unwrap_or_else(|e| {
+        panic!(
+            "grammar output {:?} did not parse as JSON: {e}",
+            result.text
+        )
+    });
     assert!(parsed.get("ok").is_some_and(serde_json::Value::is_boolean));
 }
 

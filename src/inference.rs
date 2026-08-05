@@ -1367,10 +1367,7 @@ mod tests {
     }
 
     /// A slot that streams to `tx` and stops on `stop`.
-    fn streaming_slot(
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
-        stop: &[&str],
-    ) -> Slot {
+    fn streaming_slot(tx: tokio::sync::mpsc::UnboundedSender<String>, stop: &[&str]) -> Slot {
         let stop: Vec<String> = stop.iter().map(|s| (*s).to_owned()).collect();
         Slot {
             token_tx: Some(tx),

@@ -69,10 +69,7 @@ const ROUTE_GRAMMAR: &str = r#"root ::= [ \n]* ("simple" | "hard")"#;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 || args[1] == "--help" || args[1] == "-h" {
-        eprintln!(
-            "Usage: {} <router.gguf> <thinker.gguf> [prompt]",
-            args[0]
-        );
+        eprintln!("Usage: {} <router.gguf> <thinker.gguf> [prompt]", args[0]);
         std::process::exit(2);
     }
     let prompt = args
@@ -109,14 +106,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_max_tokens(8),
     )?;
     let hard = route.text.trim() == "hard";
-    println!("route: {} ({} prompt tokens)", route.text.trim(), route.prompt_tokens);
+    println!(
+        "route: {} ({} prompt tokens)",
+        route.text.trim(),
+        route.prompt_tokens
+    );
 
     // Answer on whichever model the route chose. Only the "hard" path pays for
     // loading the larger model.
     let answer = if hard {
-        thinker.with(|c| {
-            c.complete(Request::new(&prompt).with_max_tokens(512))
-        })??
+        thinker.with(|c| c.complete(Request::new(&prompt).with_max_tokens(512)))??
     } else {
         router.complete(Request::new(&prompt).with_max_tokens(128))?
     };

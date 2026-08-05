@@ -16,8 +16,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use llamad::client::Client;
-use llamad::inference::Engine;
 use llamad::config::InferenceConfig;
+use llamad::inference::Engine;
 use llamad::protocol::{InferCmd, LlamaError, Request};
 use serial_test::serial;
 
@@ -74,7 +74,9 @@ fn two_models_run_side_by_side_with_independent_configs() {
     .expect("thinker client");
 
     // Both are live at the same time and each serves its own model.
-    let routed = router.complete(short("Say hi.")).expect("router completion");
+    let routed = router
+        .complete(short("Say hi."))
+        .expect("router completion");
     let thought = thinker
         .complete(short("Say hi."))
         .expect("thinker completion");
