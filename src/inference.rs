@@ -330,39 +330,44 @@ fn fallback_to_full_prefill(slot: &mut Slot, lcp: usize, idx: usize) {
 
 // ── Command dispatch ──────────────────────────────────────────────────────────
 
+/// Choose which free slot should serve `tokens`.
+///
+/// Prefers the free slot whose retained KV prefix shares the most tokens with
+/// the incoming prompt. Selection must be prefix-aware because the reuse
+/// machinery below only ever compares the prompt against `slot_cache[idx]`:
+/// with plain first-free selection, a request that arrives while slot 0 is
+/// busy lands on slot 1 and full-prefills, even when slot 2 sat idle holding
+/// an exact prefix of it. That is the common shape for a repeated system
+/// prompt under any concurrency at all.
+///
+/// Ties — including the all-zero case where no slot matches — resolve to the
+/// lowest free index, so cold-start and single-slot behaviour is identical to
+/// first-free selection.
+fn select_slot(
+    slots: &[Option<Slot>],
+    slot_cache: &[Vec<LlamaToken>],
+    tokens: &[LlamaToken],
+) -> Option<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .map(|(i, _)| (i, longest_common_prefix(&slot_cache[i], tokens)))
+        // `max_by_key` keeps the *last* maximum, so `Reverse(i)` is what makes
+        // the lowest index win a tie instead of the highest.
+        .max_by_key(|&(i, lcp)| (lcp, std::cmp::Reverse(i)))
+        .map(|(i, _)| i)
+}
+
 fn fill_empty_slot(
     ctx: &mut LlamaContext,
     slots: &mut [Option<Slot>],
     slot_cache: &mut [Vec<LlamaToken>],
     cmd: PreparedCmd,
 ) {
-    let idx = match slots.iter().position(|s| s.is_none()) {
-        Some(i) => i,
-        None => {
-            tracing::warn!("All slots full, dropping request");
-            match cmd {
-                PreparedCmd::Run { resp, .. } => {
-                    let _ = resp.send(Err(LlamaError::Inference(
-                        "all slots busy, try again later".into(),
-                    )));
-                }
-                PreparedCmd::RunStream {
-                    token_tx, done_tx, ..
-                } => {
-                    if let Some(done) = done_tx {
-                        let _ = done.send(Err(LlamaError::Inference(
-                            "all slots busy, try again later".into(),
-                        )));
-                    }
-                    drop(token_tx);
-                }
-                PreparedCmd::Shutdown => {}
-            }
-            return;
-        }
-    };
-    // Destructured by value: cloning `tokens` here would copy the whole
-    // tokenized prompt on every request.
+    // Destructured by value, and before slot selection: cloning `tokens` here
+    // would copy the whole tokenized prompt on every request, and
+    // `select_slot` needs them to score each free slot's cached prefix.
     let (tokens, max_gen, temperature, resp, token_tx, done_tx) = match cmd {
         PreparedCmd::Run {
             tokens,
@@ -379,6 +384,22 @@ fn fill_empty_slot(
         } => (tokens, max_gen, temperature, None, Some(token_tx), done_tx),
         PreparedCmd::Shutdown => {
             tracing::warn!("Shutdown received outside of main loop");
+            return;
+        }
+    };
+
+    let idx = match select_slot(slots, slot_cache, &tokens) {
+        Some(i) => i,
+        None => {
+            tracing::warn!("All slots full, dropping request");
+            let err = LlamaError::Inference("all slots busy, try again later".into());
+            if let Some(resp) = resp {
+                let _ = resp.send(Err(err.clone()));
+            }
+            if let Some(done) = done_tx {
+                let _ = done.send(Err(err));
+            }
+            drop(token_tx);
             return;
         }
     };
@@ -1451,6 +1472,92 @@ mod tests {
         assert_eq!(longest_common_prefix(&[], &[LlamaToken::new(1)]), 0);
         assert_eq!(longest_common_prefix(&[LlamaToken::new(1)], &[]), 0);
         assert_eq!(longest_common_prefix(&[], &[]), 0);
+    }
+
+    // ── select_slot (prefix-aware routing) ───────────────────────────────────
+
+    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
+        ids.iter().copied().map(LlamaToken::new).collect()
+    }
+
+    /// `slots` from a spec of which indices are occupied.
+    fn slots_with_busy(n: usize, busy: &[usize]) -> Vec<Option<Slot>> {
+        (0..n)
+            .map(|i| {
+                if busy.contains(&i) {
+                    Some(slot_for_request())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_select_slot_cold_start_picks_lowest_index() {
+        // No slot holds a cache: every candidate scores 0, so the tie-break
+        // must reproduce first-free selection exactly.
+        let slots = slots_with_busy(4, &[]);
+        let cache = vec![Vec::new(); 4];
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1, 2, 3])), Some(0));
+    }
+
+    #[test]
+    fn test_select_slot_prefers_free_slot_holding_the_prefix() {
+        // The regression this whole function exists for: slot 0 is busy, so
+        // first-free would hand the request to slot 1 and full-prefill —
+        // while slot 3 sits idle holding an exact prefix of the prompt.
+        let slots = slots_with_busy(4, &[0]);
+        let mut cache = vec![Vec::new(); 4];
+        cache[3] = toks(&[1, 2, 3]);
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1, 2, 3, 4])), Some(3));
+    }
+
+    #[test]
+    fn test_select_slot_picks_longest_prefix_not_merely_any_match() {
+        let slots = slots_with_busy(4, &[]);
+        let mut cache = vec![Vec::new(); 4];
+        cache[1] = toks(&[1, 2]); // lcp 2
+        cache[2] = toks(&[1, 2, 3, 4]); // lcp 4 — the best
+        cache[3] = toks(&[1]); // lcp 1
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1, 2, 3, 4])), Some(2));
+    }
+
+    #[test]
+    fn test_select_slot_ignores_cache_of_busy_slots() {
+        // Slot 2 holds the perfect prefix but is mid-generation; its KV is not
+        // available for reuse, so routing must fall to a free slot.
+        let slots = slots_with_busy(4, &[2]);
+        let mut cache = vec![Vec::new(); 4];
+        cache[2] = toks(&[1, 2, 3, 4]);
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1, 2, 3, 4])), Some(0));
+    }
+
+    #[test]
+    fn test_select_slot_equal_prefix_lengths_resolve_to_lowest_index() {
+        // `max_by_key` keeps the last maximum; without the `Reverse(i)` term
+        // this would return 3 and churn caches for no benefit.
+        let slots = slots_with_busy(4, &[]);
+        let mut cache = vec![Vec::new(); 4];
+        cache[1] = toks(&[1, 2]);
+        cache[3] = toks(&[1, 2]);
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1, 2, 9])), Some(1));
+    }
+
+    #[test]
+    fn test_select_slot_all_busy_returns_none() {
+        let slots = slots_with_busy(2, &[0, 1]);
+        let cache = vec![Vec::new(); 2];
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1])), None);
+    }
+
+    #[test]
+    fn test_select_slot_single_slot_always_routes_to_zero() {
+        // The default configuration: one slot, and a non-matching cache must
+        // not make selection fail — it routes to 0 and full-prefills.
+        let slots = slots_with_busy(1, &[]);
+        let cache = vec![toks(&[7, 8, 9])];
+        assert_eq!(select_slot(&slots, &cache, &toks(&[1, 2])), Some(0));
     }
 
     // ── begin_request ────────────────────────────────────────────────────────

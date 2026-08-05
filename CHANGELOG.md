@@ -39,11 +39,21 @@ First public release. Everything below is new.
 - Slotted continuous batching: up to `LLAMAD_N_SLOTS` concurrent sequences
   share a single `LlamaContext`, decoded in one batch per step and sampled
   per slot. Measured ~1.6–1.9x aggregate throughput over single-request
-  decode under 4-slot load.
+  decode with `LLAMAD_N_SLOTS=4`.
+- Concurrency is opt-in: `LLAMAD_N_SLOTS` defaults to **1**, so a default
+  engine gives each request the whole `LLAMAD_N_CTX`. Slots partition context
+  statically (`N_CTX / N_SLOTS`) and an idle slot's share is not lendable, so
+  a multi-slot default would silently cut every single-request caller's prompt
+  budget to a fraction of the context for concurrency it never uses.
 - KV-prefix reuse: a completed sequence's KV prefix is retained and reused on
   the next request into the same slot. Gated on a startup probe for partial
   KV rewind support, degrading loudly to full-prefill-per-request on
   hybrid/SSM models that cannot rewind.
+- Prefix-aware slot routing: a request is placed in the free slot whose
+  retained KV prefix shares the most tokens with it, rather than the lowest
+  free index. First-free placement would strand the reuse cache whenever a
+  lower-numbered slot was busy — the common case for a repeated system prompt
+  under concurrency. Ties resolve to the lowest free index.
 - Preprocess offload: chat templating and tokenization run on a dedicated
   thread, so a long prompt never stalls in-flight generations.
 - Per-slot token budgets, incremental UTF-8 assembly across token boundaries,

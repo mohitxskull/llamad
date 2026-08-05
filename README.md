@@ -13,9 +13,17 @@ let text = client.complete_text("tell me a joke")?;
 
 A `Client` owns an `Engine`: one loaded model plus two threads. Inference runs
 on a dedicated OS thread with **slotted continuous batching** — up to
-`LLAMAD_N_SLOTS` (default 4) concurrent sequences share a single
-`LlamaContext`. The inference loop reuses one `LlamaBatch` (cleared per step)
-with all active slots, decodes once, then samples per-slot.
+`LLAMAD_N_SLOTS` concurrent sequences share a single `LlamaContext`. The
+inference loop reuses one `LlamaBatch` (cleared per step) with all active
+slots, decodes once, then samples per-slot.
+
+**Concurrency is opt-in.** `LLAMAD_N_SLOTS` defaults to **1**, so a default
+engine gives every request the whole `LLAMAD_N_CTX` (2048 tokens). Slots
+partition that context *statically* — `N_CTX / N_SLOTS`, and an idle slot's
+share is not lendable to a busy one. Raising `LLAMAD_N_SLOTS` to 4 therefore
+does not add capacity; it cuts each request's prompt-plus-generation budget to
+512 tokens. Raise `LLAMAD_N_CTX` alongside it, and only when you actually
+issue concurrent requests.
 
 ```
 ┌──────────────┐   mpsc::channel    ┌────────────────────┐   mpsc::channel    ┌─────────────────────────────┐
@@ -33,8 +41,9 @@ busy — a shutdown flag is checked per loop iteration, not just when the comman
 channel is drained.
 
 **Slot lifecycle**: `empty → prefill (prompt phase) → generate → finish/cancel → empty`.
-- Each slot has a per-slot token budget (`N_CTX / N_SLOTS`, default 512), configurable via `LLAMAD_N_CTX` / `LLAMAD_N_SLOTS`.
-- When all `LLAMAD_N_SLOTS` slots (default 4) are full, new requests queue in the `mpsc` channel and are dequeued as slots free up.
+- Each slot has a per-slot token budget (`N_CTX / N_SLOTS`, default 2048 — one slot holding all of `N_CTX`), configurable via `LLAMAD_N_CTX` / `LLAMAD_N_SLOTS`. A prompt that exceeds its slot's budget is rejected at preprocess time rather than truncated.
+- When all `LLAMAD_N_SLOTS` slots are full, new requests queue in the `mpsc` channel and are dequeued as slots free up.
+- **Slot routing is prefix-aware**: an incoming request goes to the free slot whose retained KV prefix shares the most tokens with it, not simply to the lowest free index. Without this, a request arriving while slot 0 is busy would full-prefill on slot 1 even when an idle slot held an exact prefix of it — the common shape for a repeated system prompt. Ties resolve to the lowest free index.
 - KV cache is cleared per-sequence (`ctx.clear_kv_cache_seq`) on finish, cancel, and streaming client disconnect. When reuse is on (`LLAMAD_KV_CACHE=on` and the model supports partial KV rewind), a completed sequence's KV prefix is retained and reused on the next request into the same slot — but only while its length stayed within the per-slot budget; a sequence that hit the generation budget is fully cleared instead.
 
 **Preprocessing**: chat templating, tokenization, and the per-slot budget
@@ -56,6 +65,46 @@ src/
 ├── server.rs      Unix socket server (JSON/NDJSON over UDS)
 └── main.rs        Daemon entry point (requires the `bin` feature, on by default)
 ```
+
+### Design tradeoffs
+
+These are deliberate choices, not oversights. Read them before embedding the
+library — each one is the cost of something else it buys you.
+
+- **No fault isolation: llama.cpp shares your process.** The library calls
+  ggml through FFI on a thread inside the host process — that is what "no
+  HTTP, no sidecar" means, and it is why there is no IPC hop or serialization
+  on the request path. The consequence is that a fault inside the C++ backend
+  (an out-of-bounds tensor access, a driver-level allocation failure, an
+  uncaught abort) terminates the **whole host process**. It bypasses Rust
+  destructors, so `Engine::drop` does not run and nothing is unwound.
+  Rust-level errors are still returned normally as `LlamaError`; this applies
+  only to faults below the FFI boundary. If your host process is doing
+  something it cannot afford to lose, run the `llamad` daemon binary and talk
+  to it over the Unix socket — that puts a process boundary back in, at the
+  cost of the socket round-trip. The in-process path is the right default for
+  CLI tools and local utilities, where the inference *is* the program.
+
+- **Static context partitioning, not paged KV.** `N_CTX` is divided evenly
+  across slots up front. There is no unified KV pool and no PagedAttention-style
+  block allocator, so an idle slot's tokens cannot be lent to a busy one: with
+  4 slots, a 1000-token prompt is rejected even when three slots are empty.
+  Defaulting to a single slot keeps this from biting the common case; a
+  multi-tenant backend with heterogeneous prompt sizes is not what this
+  library is good at.
+
+- **Prefill is not chunked.** `n_batch` is set to `n_ctx`, so a prompt is
+  prefilled in one `decode` call. Under multi-slot load a long prompt entering
+  one slot stalls token generation on the others for that step (ggml still
+  splits the work into `n_ubatch` chunks internally, which bounds memory but
+  not the stall). Prefill dominates TTFT for long prompts — see the batch
+  table. Chunked prefill would fix the cross-slot jitter and is not
+  implemented.
+
+- **KV reuse is per-slot and non-persistent.** Prefix reuse compares against
+  the cache retained by the *selected slot* (routing is prefix-aware, see
+  above), not a global content-addressed prefix tree. Nothing survives engine
+  shutdown.
 
 ## Usage
 
@@ -213,7 +262,7 @@ KV prefix reuse is probe-gated per model: it engages on pure-attention GGUFs (e.
 
 Single-request throughput measured 2026-07-31 on release builds (`cargo build --release --features native`, 4 physical threads, 256-token generations). Spread on the 230M is thermal/load variance between runs (avg 63 tok/s in a cool run, 39 tok/s in a warm one) — not code variance. Reproduce with the bundled benchmark harness: `cargo run --release --features native --example bench -- <model.gguf> <n_repeat> [system_prompt]` (see `examples/bench.rs`).
 
-### Batch throughput and latency (i5-1135G7, 4 threads, 4 slots)
+### Batch throughput and latency (i5-1135G7, 4 threads, `LLAMAD_N_SLOTS=4`)
 
 | Model | Single req | 4 concurrent (aggregate) | TTFT short prompt | TTFT ~480-tok prompt |
 |---|---|---|---|---|
@@ -242,10 +291,14 @@ When `temperature` is set to 0.0 or below, a greedy sampler is used instead.
   thread (`llamad-preprocess`); a long prompt no longer stalls in-flight
   generations on the inference thread. TTFT for long prompts is prefill-
   dominated, not tokenization-dominated (see batch table above).
-- **Slotted batching**: 4 slots * 512 tokens = 2048 total context. Multiple
-  requests decode simultaneously — measured ~1.6–1.9x aggregate throughput
-  scaling over single-request decode under 4-slot load (see batch table
-  above).
+- **Slotted batching**: multiple requests decode simultaneously — measured
+  ~1.6–1.9x aggregate throughput scaling over single-request decode under
+  4-slot load (see batch table above). This is opt-in: the default is one slot
+  holding all 2048 tokens of context, and the batch figures were taken with
+  `LLAMAD_N_SLOTS=4` (4 slots × 512 tokens). Aggregate throughput scales
+  because batched slots amortize one pass of weight reads across sequences;
+  *per-sequence* speed still drops, so single-request latency is best at the
+  default single slot.
 - **Thread counts**: `n_threads` (decode) and `n_threads_batch` (prefill)
   default to `num_cpus::get_physical()` (not `thread::available_parallelism()`)
   to avoid hyperthread collapse. On the test hardware (i5-1135G7, 4 physical /
@@ -280,7 +333,7 @@ Environment variables (read once per engine at startup; unparsable values fall b
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLAMAD_N_SLOTS` | 4 | Concurrent sequences (clamped 1–512); KV context is split evenly across slots |
+| `LLAMAD_N_SLOTS` | 1 | Concurrent sequences (clamped 1–512); KV context is split *statically and evenly* across slots, so raising this divides each request's budget rather than adding capacity — raise `LLAMAD_N_CTX` with it |
 | `LLAMAD_N_CTX` | 2048 | Total KV-context capacity in tokens, all slots (clamped to `n_slots`…1,048,576) |
 | `LLAMAD_N_THREADS` | physical cores | Threads for single-token decode (clamped 1–256) |
 | `LLAMAD_N_THREADS_BATCH` | physical cores | Threads for batched prompt processing, prefill (clamped 1–256) |

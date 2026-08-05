@@ -13,6 +13,20 @@ fn short_req(text: &str) -> Request {
     Request::new(text).with_max_tokens(10)
 }
 
+/// Run `f` with `LLAMAD_N_SLOTS` set, then restore the environment.
+///
+/// `Engine::start` reads its config synchronously before spawning any thread,
+/// so the variable only needs to be live across the `start_inference` call.
+/// Safe because every caller is `#[serial]`.
+fn with_n_slots<T>(n: &str, f: impl FnOnce() -> T) -> T {
+    // SAFETY: serialized by `#[serial]`; no other test in this binary reads
+    // this variable concurrently.
+    unsafe { std::env::set_var("LLAMAD_N_SLOTS", n) };
+    let out = f();
+    unsafe { std::env::remove_var("LLAMAD_N_SLOTS") };
+    out
+}
+
 fn oneshot_bridge<T: Send + 'static>(rx: tokio::sync::oneshot::Receiver<T>) -> mpsc::Receiver<T> {
     let (tx, out_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -126,12 +140,18 @@ fn client_model_load_failure_surfaces_as_crash() {
     assert!(matches!(err, LlamaError::InferenceCrashed));
 }
 
-// ── Slot queuing (N_SLOTS=4, 5 requests — 5th queued until a slot frees) ──
+// ── Slot queuing (5 requests — 5th queued until a slot frees) ──
+//
+// These set `LLAMAD_N_SLOTS=4` explicitly: the default is 1 slot, under which
+// all five requests would queue trivially and the test would no longer
+// exercise the "more requests than slots" path it exists for.
 
 #[serial]
 #[test]
 fn batch_overflow_queues_fifth() {
-    let engine = start_inference(model_230m()).expect("start inference thread");
+    let engine = with_n_slots("4", || {
+        start_inference(model_230m()).expect("start inference thread")
+    });
 
     let mut bridges: Vec<mpsc::Receiver<Result<InferResult, LlamaError>>> = Vec::new();
     for i in 0..5 {
@@ -167,7 +187,9 @@ fn batch_overflow_queues_fifth() {
 #[serial]
 #[test]
 fn batch_overflow_streaming_queues_fifth() {
-    let engine = start_inference(model_230m()).expect("start inference thread");
+    let engine = with_n_slots("4", || {
+        start_inference(model_230m()).expect("start inference thread")
+    });
 
     let mut bridges: Vec<mpsc::Receiver<Result<InferResult, LlamaError>>> = Vec::new();
     let mut keepalive: Vec<tokio::sync::mpsc::UnboundedReceiver<String>> = Vec::new();

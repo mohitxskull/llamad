@@ -6,6 +6,12 @@
 use std::env;
 
 /// Slots, context and thread configuration for a single inference loop.
+///
+/// The default is **one slot holding the whole context**. Concurrency is
+/// opt-in because slots partition `n_ctx` statically: raising `n_slots` to 4
+/// does not add capacity, it cuts every request's token budget to a quarter.
+/// A caller that never issues concurrent requests would pay that cut for
+/// nothing, so the cost is charged only to callers who ask for concurrency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceConfig {
     /// Number of concurrent sequences (slots).
@@ -24,7 +30,7 @@ pub struct InferenceConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            n_slots: 4,
+            n_slots: 1,
             n_ctx: 2048,
             n_threads: 0,
             n_threads_batch: 0,
@@ -50,7 +56,7 @@ impl InferenceConfig {
     /// Read configuration from environment variables, falling back to
     /// defaults. Recognized variables:
     ///
-    /// - `LLAMAD_N_SLOTS` — concurrent sequences (default 4)
+    /// - `LLAMAD_N_SLOTS` — concurrent sequences (default 1)
     /// - `LLAMAD_N_CTX` — total KV context in tokens (default 2048)
     /// - `LLAMAD_N_THREADS` — decode threads (default: physical cores)
     /// - `LLAMAD_N_THREADS_BATCH` — prefill threads (default: physical cores)
@@ -82,6 +88,10 @@ impl InferenceConfig {
     }
 
     /// Per-slot token budget: total context divided evenly across slots.
+    ///
+    /// This is a *static* partition — an idle slot's share is not lendable to
+    /// a busy one. With the default single slot the budget is all of `n_ctx`;
+    /// every additional slot divides it.
     pub fn per_slot_budget(&self) -> u32 {
         self.n_ctx / self.n_slots as u32
     }
@@ -131,11 +141,14 @@ mod tests {
     #[test]
     fn test_defaults() {
         let cfg = InferenceConfig::default();
-        assert_eq!(cfg.n_slots, 4);
+        // One slot by default: a single request gets the *whole* context, not
+        // a fraction of it. A regression back to a multi-slot default would
+        // silently cut every default caller's prompt budget.
+        assert_eq!(cfg.n_slots, 1);
         assert_eq!(cfg.n_ctx, 2048);
         assert_eq!(cfg.n_threads, cfg.n_threads_batch);
         assert!(cfg.n_threads >= 1);
-        assert_eq!(cfg.per_slot_budget(), 512);
+        assert_eq!(cfg.per_slot_budget(), 2048);
     }
 
     #[test]
@@ -163,9 +176,9 @@ mod tests {
             std::env::remove_var("LLAMAD_N_THREADS_BATCH");
         }
         let cfg = InferenceConfig::from_env();
-        assert_eq!(cfg.n_slots, 4);
+        assert_eq!(cfg.n_slots, 1);
         assert_eq!(cfg.n_ctx, 2048);
-        assert_eq!(cfg.per_slot_budget(), 512);
+        assert_eq!(cfg.per_slot_budget(), 2048);
     }
 
     #[test]
@@ -196,7 +209,7 @@ mod tests {
     fn test_from_env_ignores_invalid_values_and_clamps() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
-            std::env::set_var("LLAMAD_N_SLOTS", ""); // empty → default 4
+            std::env::set_var("LLAMAD_N_SLOTS", ""); // empty → default 1
             std::env::set_var("LLAMAD_N_CTX", "0"); // parses → sane() clamps up to n_slots
             std::env::set_var("LLAMAD_N_THREADS", "0"); // parses → sane() clamps to ≥ 1
             std::env::set_var("LLAMAD_N_THREADS_BATCH", "banana"); // unparsable → default
@@ -208,14 +221,14 @@ mod tests {
             std::env::remove_var("LLAMAD_N_THREADS");
             std::env::remove_var("LLAMAD_N_THREADS_BATCH");
         }
-        assert_eq!(cfg.n_slots, 4); // "" empty → default
-        assert_eq!(cfg.n_ctx, 4); // 0 clamps up to n_slots
+        assert_eq!(cfg.n_slots, 1); // "" empty → default
+        assert_eq!(cfg.n_ctx, 1); // 0 clamps up to n_slots
         assert_eq!(cfg.n_threads, 1); // 0 clamps to ≥ 1
         assert_eq!(
             cfg.n_threads_batch,
             InferenceConfig::default().n_threads_batch
         ); // "banana" unparsable → default
-        assert_eq!(cfg.per_slot_budget(), 1); // 4 ctx / 4 slots
+        assert_eq!(cfg.per_slot_budget(), 1); // 1 ctx / 1 slot
     }
 
     #[test]

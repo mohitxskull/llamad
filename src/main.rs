@@ -11,7 +11,7 @@ fn usage(program: &str) {
     eprintln!("  [socket-path]             Unix socket path (default: {DEFAULT_SOCKET_PATH})");
     eprintln!();
     eprintln!("Environment:");
-    eprintln!("  LLAMAD_N_SLOTS            Concurrent sequences (default 4)");
+    eprintln!("  LLAMAD_N_SLOTS            Concurrent sequences (default 1; splits N_CTX)");
     eprintln!("  LLAMAD_N_CTX              Total KV context in tokens (default 2048)");
     eprintln!("  LLAMAD_N_THREADS          Decode threads (default: physical cores)");
     eprintln!("  LLAMAD_N_THREADS_BATCH    Prefill threads (default: physical cores)");
