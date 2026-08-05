@@ -36,6 +36,8 @@ jobs:
   # Everything that can fail cheaply runs before anything irreversible.
   verify:
     runs-on: ubuntu-latest
+    # Well under the 360-minute default: these are hang guards, not headroom.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -68,8 +70,10 @@ jobs:
       # `--lib` and `--doc` cannot be combined (cargo: "can't mix --doc with
       # other target selecting options"), so these are separate steps.
       #
-      # The 32 real-model tests need ~1.4 GB of GGUFs and do not run here;
-      # they are a local gate. Run `cargo test` locally before tagging.
+      # The 32 real-model tests are not repeated here — the `real-model` job in
+      # ci.yml already ran them against this commit on main. Keeping them out
+      # of the release path means a HuggingFace outage cannot block a release,
+      # and the tag is only ever pushed at a commit CI has already gone green on.
       - name: Unit tests
         run: cargo test --lib
 
@@ -90,6 +94,10 @@ jobs:
   publish:
     needs: verify
     runs-on: ubuntu-latest
+    # `cargo publish` re-runs a verification build of the packaged tarball,
+    # which compiles llama.cpp from source. Given room, since this is the step
+    # that must not be retried casually.
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write # required to mint the Trusted Publishing token
@@ -124,6 +132,8 @@ jobs:
   release:
     needs: publish
     runs-on: ubuntu-latest
+    # Only git-cliff and an API call; no compilation.
+    timeout-minutes: 15
     permissions:
       contents: write # to create the GitHub Release
     steps:
