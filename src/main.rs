@@ -1,21 +1,49 @@
-//! The `llamad` daemon: serves the JSON/NDJSON protocol over a Unix socket.
+//! The `llamad` daemon: serves the JSON/NDJSON protocol over local IPC.
 //!
-//! **Unix only.** Cargo cannot gate a `[[bin]]` target by platform, so this
-//! file still compiles on Windows — it just exits with an explanation. The
-//! library is portable; only the daemon needs a Unix socket.
+//! Unix domain socket on Unix, named pipe on Windows. The wire protocol is
+//! identical; only the listener and the accept loop differ.
 
-#[cfg(unix)]
 use llamad::inference::Engine;
-#[cfg(unix)]
-use llamad::server::{DEFAULT_SOCKET_PATH, bind_socket, handle_connection};
+use llamad::server::{DEFAULT_SOCKET_PATH, handle_connection};
 
+#[cfg(windows)]
+use llamad::server::bind_pipe;
 #[cfg(unix)]
+use llamad::server::bind_socket;
+
+/// Wait for the next client and return its stream.
+///
+/// A Unix listener yields a fresh stream per connection and keeps listening.
+/// A named-pipe server handle *becomes* the connection once a client attaches,
+/// so the Windows arm creates the next instance and swaps it in — otherwise
+/// nothing would be listening between connections, and a client arriving in
+/// that window would get "file not found" rather than waiting.
+#[cfg(unix)]
+async fn accept(
+    listener: &mut tokio::net::UnixListener,
+    _name: &str,
+) -> anyhow::Result<tokio::net::UnixStream> {
+    Ok(listener.accept().await?.0)
+}
+
+#[cfg(windows)]
+async fn accept(
+    pipe: &mut tokio::net::windows::named_pipe::NamedPipeServer,
+    name: &str,
+) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    pipe.connect().await?;
+    let next = bind_pipe(name, false)?;
+    Ok(std::mem::replace(pipe, next))
+}
+
 fn usage(program: &str) {
     eprintln!("Usage: {program} <model.gguf> [socket-path]");
     eprintln!();
     eprintln!("Arguments:");
     eprintln!("  <model.gguf>              Path to GGUF model file (required)");
-    eprintln!("  [socket-path]             Unix socket path (default: {DEFAULT_SOCKET_PATH})");
+    eprintln!(
+        "  [socket-path]             Socket path or pipe name (default: {DEFAULT_SOCKET_PATH})"
+    );
     eprintln!();
     eprintln!("Environment:");
     eprintln!("  LLAMAD_N_SLOTS            Concurrent sequences (default 1; splits N_CTX)");
@@ -26,23 +54,6 @@ fn usage(program: &str) {
     eprintln!("  RUST_LOG                  Log filter (default: warn)");
 }
 
-/// On Windows there is no `tokio::net::UnixListener`, so the daemon cannot be
-/// built. Exiting with a clear message beats a link error, and beats silently
-/// shipping a binary that appears to work.
-///
-/// The library still works on Windows — use [`llamad::client::Client`]
-/// in-process instead. Serving over Windows named pipes would be a real
-/// feature, not a port of this file; open an issue if you need it.
-#[cfg(not(unix))]
-fn main() {
-    eprintln!(
-        "the llamad daemon requires Unix domain sockets and is not available on this platform.\n\
-         Use the library in-process instead: llamad::client::Client::new(\"model.gguf\")"
-    );
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -72,7 +83,11 @@ async fn main() -> anyhow::Result<()> {
         .map_or(DEFAULT_SOCKET_PATH, |s| s.as_str())
         .to_owned();
 
-    let listener = bind_socket(&socket_path)?;
+    #[cfg(unix)]
+    let mut acceptor = bind_socket(&socket_path)?;
+    #[cfg(windows)]
+    let mut acceptor = bind_pipe(&socket_path, true)?;
+
     let engine = Engine::start(model_path)?;
 
     tracing::info!("llamad listening on {socket_path}");
@@ -83,8 +98,8 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Shutdown signal received");
                 break;
             }
-            result = listener.accept() => {
-                let (mut stream, _) = result?;
+            result = accept(&mut acceptor, &socket_path) => {
+                let mut stream = result?;
                 let cmd_tx = engine.sender().clone();
                 tokio::spawn(async move {
                     handle_connection(&mut stream, &cmd_tx).await;
@@ -98,6 +113,9 @@ async fn main() -> anyhow::Result<()> {
     // blocking-safe thread because nothing else is scheduled on this runtime
     // once the accept loop has exited.
     tokio::task::spawn_blocking(move || engine.shutdown()).await?;
+    // Unix sockets leave a filesystem entry behind; named pipes do not exist
+    // once the last handle closes, so there is nothing to unlink on Windows.
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&socket_path);
     tracing::info!("Goodbye");
 

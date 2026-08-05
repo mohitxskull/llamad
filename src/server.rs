@@ -1,20 +1,48 @@
-//! Unix-socket server speaking the JSON (and NDJSON, when streaming) protocol.
+//! Local IPC server speaking the JSON (and NDJSON, when streaming) protocol.
 //!
-//! One request per connection: the client writes a JSON object, half-closes
-//! the write side, and reads the reply.
+//! One request per connection. The client writes a JSON object and ends the
+//! request with **either a newline or a half-close**, then reads the reply.
+//!
+//! The transport is a Unix domain socket on Unix and a named pipe on Windows;
+//! the protocol above is identical on both. The handlers are generic over the
+//! stream, so only [`bind_socket`] / [`bind_pipe`] differ by platform.
+//!
+//! # Why a newline terminates a request
+//!
+//! The original protocol ended a request at EOF, which requires the client to
+//! half-close its write side while keeping the read side open. Windows named
+//! pipes have no half-close — closing the handle closes both directions — so
+//! an EOF-only frame would deadlock there: the server would wait forever for a
+//! request it had already received in full.
+//!
+//! A newline terminator fixes that without breaking anything, because
+//! `serde_json` escapes newlines inside strings and never emits a raw one. A
+//! client that half-closes still works: EOF ends the frame too.
 
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
 use std::sync::mpsc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
 use crate::protocol::{InferCmd, LlamaError, Request, Response, TokenChunk};
 
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use tokio::net::UnixListener;
+
 /// Socket path used when none is given.
+#[cfg(unix)]
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/llamad.sock";
+/// Pipe name used when none is given.
+///
+/// Windows named pipes live in a flat kernel namespace under `\\.\pipe\`, not
+/// on the filesystem, so there is no directory to place this in and nothing to
+/// clean up after a crash — the name is released when the last handle closes.
+#[cfg(windows)]
+pub const DEFAULT_SOCKET_PATH: &str = r"\\.\pipe\llamad";
 /// How long a client may take to send its whole request.
 pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a streaming client may wait between tokens before giving up.
@@ -36,6 +64,7 @@ pub const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 ///
 /// [`LlamaError::Io`] if the path is taken by a live daemon, is occupied by
 /// something other than a socket, or cannot be bound.
+#[cfg(unix)]
 pub fn bind_socket(path: impl AsRef<Path>) -> Result<UnixListener, LlamaError> {
     let path = path.as_ref();
     let listener = match UnixListener::bind(path) {
@@ -72,44 +101,102 @@ pub fn bind_socket(path: impl AsRef<Path>) -> Result<UnixListener, LlamaError> {
     Ok(listener)
 }
 
+/// Create a named-pipe server instance at `name` (e.g. `\\.\pipe\llamad`).
+///
+/// Call once for the first instance with `first` set, then again after each
+/// accepted connection to have an instance waiting for the next client —
+/// unlike a Unix listener, a named-pipe server handle *is* the connection once
+/// a client attaches, so the accept loop must create its successor.
+///
+/// `first_pipe_instance` on the first call makes creation fail if the name is
+/// already taken, which is the closest equivalent to refusing to steal a live
+/// daemon's socket. There is no stale pipe to reclaim: the name disappears
+/// when the last handle closes, including when the process is killed.
+///
+/// # Access control
+///
+/// `reject_remote_clients` is set, so the pipe cannot be reached over SMB from
+/// another machine — without it, a named pipe is remotely accessible by
+/// default, which a Unix socket never is.
+///
+/// Local access falls back to the default DACL for the creating process,
+/// which grants the creating user, `SYSTEM` and `Administrators`. That is
+/// broadly comparable to the `0600` the Unix path sets, but it is *not* the
+/// same guarantee — an administrator on the machine can open the pipe. If you
+/// need stricter local control, run the daemon as a dedicated user.
+///
+/// # Errors
+///
+/// [`LlamaError::Io`] if the name is taken by a running daemon, or the pipe
+/// cannot be created.
+#[cfg(windows)]
+pub fn bind_pipe(
+    name: &str,
+    first: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, LlamaError> {
+    tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(first)
+        .reject_remote_clients(true)
+        .create(name)
+        .map_err(LlamaError::Io)
+}
+
+/// Read one request frame: everything up to the first newline, or to EOF.
+///
+/// Returns the body, or `None` if the client exceeded [`MAX_REQUEST_BYTES`].
+/// The cap is read one byte past the limit so an over-long body is detected
+/// rather than silently truncated into a confusing parse error.
+async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    let mut reader = BufReader::new(stream.take(MAX_REQUEST_BYTES + 1));
+    reader.read_until(b'\n', &mut buf).await?;
+    if buf.len() as u64 > MAX_REQUEST_BYTES {
+        return Ok(None);
+    }
+    // A trailing newline is a frame terminator, not part of the JSON.
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    Ok(Some(buf))
+}
+
 /// Read one request from `stream`, run it, and write the reply.
-pub async fn handle_connection(
-    stream: &mut tokio::net::UnixStream,
+///
+/// Generic over the stream so the same protocol serves a Unix socket and a
+/// Windows named pipe; only the listener differs by platform.
+pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     cmd_tx: &mpsc::Sender<InferCmd>,
 ) {
-    let mut buf = Vec::new();
-    // Read one byte past the cap so an over-long body is detectable rather
-    // than silently truncated into a parse error.
-    let capped = (&mut *stream).take(MAX_REQUEST_BYTES + 1);
-    tokio::pin!(capped);
-    if tokio::time::timeout(READ_TIMEOUT, capped.read_to_end(&mut buf))
-        .await
-        .is_err()
-    {
-        let err = serde_json::json!({"error": "read timeout"});
-        let _ = stream.write_all(err.to_string().as_bytes()).await;
-        return;
-    }
+    let buf = match tokio::time::timeout(READ_TIMEOUT, read_frame(stream)).await {
+        Ok(Ok(Some(buf))) => buf,
+        Ok(Ok(None)) => {
+            // Discard whatever the client is still writing before replying.
+            // Closing a socket that has unread data queued makes the kernel
+            // send RST, which throws away our error message along with it —
+            // the client would see a bare connection reset instead of the
+            // reason. Reading into a fixed scratch buffer keeps memory
+            // bounded, and READ_TIMEOUT bounds how long a client can hold the
+            // connection open.
+            let mut sink = [0u8; 8192];
+            let _ = tokio::time::timeout(READ_TIMEOUT, async {
+                while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+            })
+            .await;
 
-    if buf.len() as u64 > MAX_REQUEST_BYTES {
-        // Discard whatever the client is still writing before replying.
-        // Closing a socket that has unread data queued makes the kernel send
-        // RST, which throws away our error message along with it — the client
-        // would see a bare connection reset instead of the reason. Reading
-        // into a fixed scratch buffer keeps memory bounded, and READ_TIMEOUT
-        // bounds how long a client can hold the connection open.
-        let mut sink = [0u8; 8192];
-        let _ = tokio::time::timeout(READ_TIMEOUT, async {
-            while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
-        })
-        .await;
-
-        let err = serde_json::json!({
-            "error": format!("request too large (max {MAX_REQUEST_BYTES} bytes)")
-        });
-        let _ = stream.write_all(err.to_string().as_bytes()).await;
-        return;
-    }
+            let err = serde_json::json!({
+                "error": format!("request too large (max {MAX_REQUEST_BYTES} bytes)")
+            });
+            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            return;
+        }
+        Ok(Err(_)) => return, // connection died mid-request; nobody to tell
+        Err(_) => {
+            let err = serde_json::json!({"error": "read timeout"});
+            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            return;
+        }
+    };
 
     if buf.is_empty() {
         let err = serde_json::json!({"error": "empty request"});
@@ -135,8 +222,8 @@ pub async fn handle_connection(
     }
 }
 
-async fn handle_streaming(
-    stream: &mut tokio::net::UnixStream,
+async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     cmd_tx: &mpsc::Sender<InferCmd>,
     req: Request,
 ) {
@@ -199,8 +286,8 @@ async fn handle_streaming(
     }
 }
 
-async fn handle_non_streaming(
-    stream: &mut tokio::net::UnixStream,
+async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     cmd_tx: &mpsc::Sender<InferCmd>,
     req: Request,
 ) {
@@ -240,7 +327,12 @@ async fn handle_non_streaming(
     }
 }
 
-#[cfg(test)]
+// The existing suite drives a Unix domain socket directly. The Windows
+// transport has its own module below; the protocol assertions are duplicated
+// rather than shared because the listener types have no common trait to
+// abstract over — a named-pipe server handle becomes the connection, a Unix
+// listener yields one.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::thread;
@@ -451,6 +543,48 @@ mod tests {
         assert_eq!(resp["prompt_tokens"], 5);
         assert_eq!(resp["generated_tokens"], 2);
         assert!(resp.get("done").is_none());
+
+        server.await.unwrap();
+        cmd_tx.send(InferCmd::Shutdown).ok();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn test_newline_terminated_request_without_half_close() {
+        // The mechanism Windows depends on. A named-pipe client cannot
+        // half-close, so the request has to be able to end at a newline while
+        // the connection stays open in both directions. Exercised here on a
+        // Unix socket because the framing is transport-independent — if this
+        // breaks, the Windows daemon deadlocks.
+        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("newline-frame.sock");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let cmd_tx = spawn_mock_inference();
+
+        let cmdtx = cmd_tx.clone();
+        let path = socket_path.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_connection(&mut stream, &cmdtx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
+        // Note: no `shutdown()`. The newline is the only end-of-request signal.
+        client
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(resp["text"], "echo: hello world");
 
         server.await.unwrap();
         cmd_tx.send(InferCmd::Shutdown).ok();
@@ -776,5 +910,172 @@ mod tests {
         server.await.unwrap();
         cmd_tx.send(InferCmd::Shutdown).ok();
         let _ = std::fs::remove_file(&socket_path);
+    }
+}
+
+// The Windows named-pipe transport. Mirrors the protocol assertions of the
+// Unix suite above against the other listener type.
+//
+// These do not run on the maintainer's machine — CI's `windows-latest` runner
+// is what verifies them, which is the whole reason the cross-platform job
+// exists. Treat a failure here as a real bug, not runner flakiness.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::thread;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    use crate::protocol::{InferCmd, InferResult};
+
+    /// A pipe name unique to this process and test, so a parallel test run
+    /// cannot collide in the flat `\\.\pipe\` namespace.
+    fn pipe_name(tag: &str) -> String {
+        format!(r"\\.\pipe\llamad-test-{}-{}", std::process::id(), tag)
+    }
+
+    /// Same echo behaviour as the Unix suite's mock; duplicated because the
+    /// two test modules are compiled on different platforms.
+    fn spawn_mock_inference() -> mpsc::Sender<InferCmd> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    InferCmd::Run { request, resp } => {
+                        let _ = resp.send(Ok(InferResult {
+                            text: format!("echo: {}", request.prompt),
+                            prompt_tokens: 5,
+                            generated_tokens: 2,
+                        }));
+                    }
+                    InferCmd::RunStream {
+                        request,
+                        token_tx,
+                        done_tx,
+                    } => {
+                        for ch in request.prompt.chars() {
+                            let _ = token_tx.send(ch.to_string());
+                        }
+                        if let Some(done) = done_tx {
+                            let _ = done.send(Ok(InferResult {
+                                text: format!("echo: {}", request.prompt),
+                                prompt_tokens: 5,
+                                generated_tokens: request.prompt.len(),
+                            }));
+                        }
+                        drop(token_tx);
+                    }
+                    InferCmd::Shutdown => break,
+                }
+            }
+        });
+        tx
+    }
+
+    #[tokio::test]
+    async fn test_bind_pipe_refuses_a_duplicate_first_instance() {
+        // The named-pipe equivalent of refusing to steal a live daemon's
+        // socket: `first_pipe_instance` fails if the name is already owned.
+        let name = pipe_name("dup");
+        let _first = bind_pipe(&name, true).expect("first instance");
+        assert!(
+            bind_pipe(&name, true).is_err(),
+            "a second first-instance claim on the same name must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_protocol_non_streaming_roundtrip_over_pipe() {
+        let name = pipe_name("nonstream");
+        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
+        let cmd_tx = spawn_mock_inference();
+        let cmdtx = cmd_tx.clone();
+
+        let server = tokio::spawn(async move {
+            server_pipe.connect().await.expect("client attach");
+            handle_connection(&mut server_pipe, &cmdtx).await;
+        });
+
+        let mut client = ClientOptions::new().open(&name).expect("open pipe");
+        let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
+        // No `shutdown()` — a named pipe has no half-close, so the trailing
+        // newline is the only thing that ends the request.
+        client
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(resp["text"], "echo: hello world");
+        assert_eq!(resp["prompt_tokens"], 5);
+        assert_eq!(resp["generated_tokens"], 2);
+
+        server.await.unwrap();
+        cmd_tx.send(InferCmd::Shutdown).ok();
+    }
+
+    #[tokio::test]
+    async fn test_protocol_streaming_roundtrip_over_pipe() {
+        let name = pipe_name("stream");
+        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
+        let cmd_tx = spawn_mock_inference();
+        let cmdtx = cmd_tx.clone();
+
+        let server = tokio::spawn(async move {
+            server_pipe.connect().await.expect("client attach");
+            handle_connection(&mut server_pipe, &cmdtx).await;
+        });
+
+        let mut client = ClientOptions::new().open(&name).expect("open pipe");
+        let req = serde_json::json!({"prompt": "hi", "stream": true});
+        client
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let output = String::from_utf8_lossy(&buf);
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines.len() >= 2, "expected at least 2 lines, got {lines:?}");
+        assert_eq!(lines[0], r#"{"token":"h"}"#);
+        assert_eq!(lines[1], r#"{"token":"i"}"#);
+
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["done"], true);
+        assert_eq!(last["text"], "echo: hi");
+
+        server.await.unwrap();
+        cmd_tx.send(InferCmd::Shutdown).ok();
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_returns_error_over_pipe() {
+        let name = pipe_name("badjson");
+        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
+        let cmd_tx = spawn_mock_inference();
+        let cmdtx = cmd_tx.clone();
+
+        let server = tokio::spawn(async move {
+            server_pipe.connect().await.expect("client attach");
+            handle_connection(&mut server_pipe, &cmdtx).await;
+        });
+
+        let mut client = ClientOptions::new().open(&name).expect("open pipe");
+        client.write_all(b"{not json}\n").await.unwrap();
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(
+            resp["error"].as_str().unwrap().contains("invalid request"),
+            "got {resp}"
+        );
+
+        server.await.unwrap();
+        cmd_tx.send(InferCmd::Shutdown).ok();
     }
 }

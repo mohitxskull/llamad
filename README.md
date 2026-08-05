@@ -35,8 +35,9 @@ process.
 | Runs in your process | yes | yes | no — separate daemon | yes (heavier) |
 | Decode loop written for you | yes | **no** — you write it | yes | yes |
 | Continuous batching | yes | no | yes | yes |
-| Transport | in-process channels; optional UDS | none | HTTP | in-process / HTTP |
+| Transport | in-process channels; optional local IPC (Unix socket / named pipe) | none | HTTP | in-process / HTTP |
 | Primary target | **CPU** | either | either, GPU-leaning | GPU-leaning |
+| Platforms | Linux, macOS, Windows (all CI-tested) | all | all | all |
 | Grammar-constrained output | yes | via raw sampler | yes | yes |
 | GPU | untested pass-through | yes | yes | yes |
 | Multi-model | one `Client` per model, sized independently | manual | registry, pull, hot-swap | multi-pipeline |
@@ -62,10 +63,14 @@ socket marginally ahead. That spread is measurement noise on a ~270 ms request,
 not a transport cost. Against a real multi-second generation it is not worth
 thinking about.
 
-The reason to prefer a Unix socket here is not throughput, it is that there is
-no network surface to get wrong: no port to allocate, no firewall rule, no
-accidental bind to `0.0.0.0`. Access is filesystem permissions — the socket is
-`0600` — instead of a network ACL.
+The reason to prefer local IPC here is not throughput, it is that there is no
+network surface to get wrong: no port to allocate, no firewall rule, no
+accidental bind to `0.0.0.0`. On Unix, access is filesystem permissions — the
+socket is `0600` — instead of a network ACL. On Windows the daemon uses a named
+pipe with `reject_remote_clients`, so it is unreachable over SMB; local access
+falls back to the default pipe DACL (the creating user, `SYSTEM` and
+`Administrators`), which is comparable to `0600` but not identical — an
+administrator on the machine can open it.
 
 **Not included, deliberately:** HTTP, an OpenAI-compatible endpoint, a model
 registry with lazy loading or eviction (several models at once is just several
@@ -372,8 +377,19 @@ its argument-handling and log-subscriber dependencies.
 
 ## Protocol
 
-One request per connection: write a JSON object, half-close the write side,
-read the reply.
+One request per connection: write a JSON object, end it with **either a
+newline or a half-close**, then read the reply.
+
+The transport is a Unix domain socket on Linux and macOS
+(`/tmp/llamad.sock`) and a named pipe on Windows (`\\.\pipe\llamad`). The wire
+format is identical on both.
+
+The newline terminator exists because Windows named pipes have no half-close —
+closing the handle closes both directions, so a request that ended only at EOF
+would deadlock: the daemon would wait forever for bytes it already had.
+`serde_json` escapes newlines inside strings and never emits a raw one, so a
+newline is an unambiguous frame boundary. Clients that half-close still work
+unchanged.
 
 Fields: `prompt` (required), `system`, `max_tokens`, `temperature`, `top_k`, `top_p`, `repeat_penalty`, `repeat_last_n`, `seed`, `stop` (`[string]`), `stream` (bool), `history` (`[{role, content}]`). See [Generation parameters](#generation-parameters) for defaults and ranges. Unknown fields rejected. Request bodies are capped at 1 MiB (`server::MAX_REQUEST_BYTES`).
 
