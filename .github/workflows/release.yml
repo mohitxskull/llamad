@@ -1,21 +1,34 @@
 name: Release
 
-# Tagging `vX.Y.Z` publishes a GitHub Release whose notes are generated from
-# the Conventional Commits since the previous tag.
+# Tagging `vX.Y.Z` publishes the crate to crates.io and then opens a GitHub
+# Release whose notes are generated from the Conventional Commits since the
+# previous tag.
 #
-# Publishing to crates.io is deliberately NOT automated: a released version
-# can be yanked but never replaced, so it stays a manual `cargo publish`.
+# The tag is the only trigger, and deliberately so: a published version can be
+# yanked but never replaced or reused, so the action that causes it should be
+# one you take on purpose. A commit-message trigger would tie the most
+# irreversible step to the most frequent one.
+#
+# Authentication uses crates.io Trusted Publishing (OIDC) — no long-lived
+# registry token is stored in this repository. Register the trusted publisher
+# once at https://crates.io/crates/llamad/settings with:
+#   repository owner:  mohitxskull
+#   repository name:   llamad
+#   workflow filename: release.yml
+#   environment:       (leave blank, or set one and add `environment:` to the
+#                       publish job below to require manual approval)
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Everything that can fail cheaply runs before anything irreversible.
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -37,15 +50,65 @@ jobs:
           fi
           echo "version $manifest"
 
-      - name: Tests
-        run: cargo test --lib --doc
+      # The changelog must actually mention this version. Cheap guard against
+      # tagging before writing the entry.
+      - name: Changelog has an entry for this version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[$tag\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$tag]' section"
+            exit 1
+          fi
 
+      # `--lib` and `--doc` cannot be combined (cargo: "can't mix --doc with
+      # other target selecting options"), so these are separate steps.
+      #
+      # The 32 real-model tests need ~1.4 GB of GGUFs and do not run here;
+      # they are a local gate. Run `cargo test` locally before tagging.
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Compiles the packaged tarball, which is what crates.io will build.
+      # Catches an `exclude` that dropped a file the crate needs.
       - name: Package
-        run: cargo package
+        run: cargo package --locked
 
-  release:
+  # The irreversible step. Runs only after `verify`, and before the GitHub
+  # Release, so a failed publish does not leave behind a release announcing a
+  # version that does not exist.
+  publish:
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required to mint the Trusted Publishing token
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Authenticate to crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the GitHub Release
     steps:
       - uses: actions/checkout@v4
         with:
