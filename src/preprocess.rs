@@ -12,7 +12,11 @@ use std::sync::mpsc;
 use llama_cpp_4::prelude::*;
 
 use crate::config::InferenceConfig;
-use crate::protocol::{InferCmd, LlamaError, PreparedCmd, RANDOM_SEED, Request, SamplingParams};
+use crate::inference::build_grammar_sampler;
+use crate::protocol::{
+    Grammar, InferCmd, LlamaError, PreparedCmd, PreparedRequest, RANDOM_SEED, Request,
+    SamplingParams,
+};
 
 /// Default sampling parameters: the Liquid AI LFM2.5 model-card values.
 ///
@@ -75,13 +79,41 @@ pub(crate) fn normalize_stop(stop: &[String]) -> Vec<String> {
     stop.iter().filter(|s| !s.is_empty()).cloned().collect()
 }
 
-/// A request that has cleared preprocessing: templated, tokenized,
-/// budget-checked, with sampling resolved and stop sequences normalized.
-pub(crate) struct Prepared {
-    pub tokens: Vec<LlamaToken>,
-    pub max_gen: u32,
-    pub sampling: SamplingParams,
-    pub stop: Vec<String>,
+/// Resolve and validate a request's grammar against the model's vocabulary.
+///
+/// Validation happens here, on the preprocess thread, because this is the
+/// trust boundary: a grammar arriving over the socket is untrusted input, and
+/// a bad one must come back to that one caller as an error rather than reach
+/// the inference thread, where llama.cpp's null-pointer-on-parse-failure would
+/// otherwise take down the engine for every client.
+///
+/// An unset grammar yields `None`. `grammar_root` defaults to `"root"`, the
+/// GBNF convention, and is ignored when no grammar is given.
+pub(crate) fn resolve_grammar(
+    model: &LlamaModel,
+    request: &Request,
+) -> std::result::Result<Option<Grammar>, LlamaError> {
+    let Some(text) = request.grammar.as_ref() else {
+        return Ok(None);
+    };
+    let root = request.grammar_root.as_deref().unwrap_or("root");
+
+    // Checked explicitly for a clear message; `build_grammar_sampler` would
+    // otherwise catch the resulting `CString::new` panic and report it as a
+    // syntax error, which would send the caller looking in the wrong place.
+    if text.contains('\0') || root.contains('\0') {
+        return Err(LlamaError::Protocol(
+            "grammar and grammar_root must not contain null bytes".into(),
+        ));
+    }
+
+    // Compile once to prove it parses, then discard: the inference thread
+    // builds the sampler it actually uses, from this same validated text.
+    build_grammar_sampler(model, text, root)?;
+    Ok(Some(Grammar {
+        text: text.clone(),
+        root: root.to_owned(),
+    }))
 }
 
 pub(crate) fn build_messages(
@@ -135,7 +167,7 @@ pub(crate) fn prepare_request(
     model: &LlamaModel,
     request: &Request,
     per_slot_budget: u32,
-) -> std::result::Result<Prepared, LlamaError> {
+) -> std::result::Result<PreparedRequest, LlamaError> {
     let messages = build_messages(request)?;
     let prompt = model
         .apply_chat_template(None, &messages, true)
@@ -144,10 +176,11 @@ pub(crate) fn prepare_request(
         .str_to_token(&prompt, AddBos::Always)
         .map_err(|e| LlamaError::Inference(e.to_string()))?;
     let (max_gen, sampling) = resolve_defaults(tokens.len(), request, per_slot_budget)?;
-    Ok(Prepared {
+    Ok(PreparedRequest {
         tokens,
         max_gen,
         sampling,
+        grammar: resolve_grammar(model, request)?,
         stop: normalize_stop(&request.stop),
     })
 }
@@ -174,14 +207,8 @@ pub(super) fn preprocess_loop(
     for cmd in cmd_rx {
         match cmd {
             InferCmd::Run { request, resp } => match prepare_request(&model, &request, budget) {
-                Ok(p) => {
-                    match prepared_tx.send(PreparedCmd::Run {
-                        tokens: p.tokens,
-                        max_gen: p.max_gen,
-                        sampling: p.sampling,
-                        stop: p.stop,
-                        resp,
-                    }) {
+                Ok(req) => {
+                    match prepared_tx.send(PreparedCmd::Run { req, resp }) {
                         Ok(()) => {}
                         Err(mpsc::SendError(PreparedCmd::Run { resp, .. })) => {
                             let _ = resp.send(Err(LlamaError::InferenceCrashed));
@@ -198,12 +225,9 @@ pub(super) fn preprocess_loop(
                 token_tx,
                 done_tx,
             } => match prepare_request(&model, &request, budget) {
-                Ok(p) => {
+                Ok(req) => {
                     match prepared_tx.send(PreparedCmd::RunStream {
-                        tokens: p.tokens,
-                        max_gen: p.max_gen,
-                        sampling: p.sampling,
-                        stop: p.stop,
+                        req,
                         token_tx,
                         done_tx,
                     }) {

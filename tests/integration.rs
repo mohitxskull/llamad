@@ -317,6 +317,131 @@ fn stop_sequence_truncates_a_streamed_completion() {
     );
 }
 
+// ─── Grammar-constrained generation ────────────────────────────────────────
+
+/// A GBNF grammar admitting exactly one of three words.
+const CHOICE_GRAMMAR: &str = r#"root ::= [ \n]* ("yes" | "no" | "maybe")"#;
+
+#[serial]
+#[test]
+fn grammar_constrains_output_to_the_grammar() {
+    // The point of grammar support: a 230M model asked an open question will
+    // ramble, but under a constraint the output *cannot* be anything else.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let result = client
+        .complete(
+            Request::new("Is the sky blue? Answer in one word.")
+                .with_grammar(CHOICE_GRAMMAR)
+                .with_max_tokens(20),
+        )
+        .expect("grammar-constrained completion");
+
+    assert!(
+        ["yes", "no", "maybe"].contains(&result.text.trim()),
+        "output {:?} escaped the grammar",
+        result.text
+    );
+}
+
+#[serial]
+#[test]
+fn grammar_applies_under_greedy_decoding() {
+    // Greedy decoding replaces the whole sampler chain, so the grammar has to
+    // be spliced in ahead of the greedy tail rather than dropped. A regression
+    // here would silently produce unconstrained output at temperature 0.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let result = client
+        .complete(
+            Request::new("Is the sky blue? Answer in one word.")
+                .with_grammar(CHOICE_GRAMMAR)
+                .with_temperature(0.0)
+                .with_max_tokens(20),
+        )
+        .expect("greedy grammar completion");
+
+    assert!(
+        ["yes", "no", "maybe"].contains(&result.text.trim()),
+        "greedy output {:?} escaped the grammar",
+        result.text
+    );
+}
+
+#[serial]
+#[test]
+fn grammar_produces_parseable_json() {
+    // The use case people actually want: structured extraction from a small
+    // model. Unconstrained, a 230M model emits malformed JSON constantly.
+    let grammar = r#"
+root   ::= "{" ws "\"ok\"" ws ":" ws bool ws "}"
+bool   ::= "true" | "false"
+ws     ::= " "?
+"#;
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let result = client
+        .complete(
+            Request::new("Reply with a JSON object having key ok.")
+                .with_grammar(grammar)
+                .with_max_tokens(40),
+        )
+        .expect("json grammar completion");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(result.text.trim()).unwrap_or_else(|e| {
+            panic!("grammar output {:?} did not parse as JSON: {e}", result.text)
+        });
+    assert!(parsed.get("ok").is_some_and(serde_json::Value::is_boolean));
+}
+
+#[serial]
+#[test]
+fn invalid_grammar_is_rejected_without_killing_the_engine() {
+    // `LlamaSampler::grammar` panics on a grammar llama.cpp cannot parse
+    // (llama.cpp returns null, the binding unwraps it). Grammars arrive over
+    // the socket, so an unguarded panic would be a remote kill of the whole
+    // engine. The bad request must fail alone and the engine keep serving.
+    let client = Client::new(model_230m()).expect("load 230M model");
+
+    let err = client
+        .complete(Request::new("hi").with_grammar("root ::= ((( unterminated"))
+        .expect_err("a malformed grammar must be rejected");
+    assert!(
+        matches!(err, LlamaError::Protocol(_)),
+        "expected a protocol error, got {err:?}"
+    );
+
+    // The engine survived: an ordinary request still works.
+    let ok = client
+        .complete(Request::new("Say hi.").with_max_tokens(10))
+        .expect("engine must still serve after a rejected grammar");
+    assert!(!ok.text.is_empty());
+}
+
+#[serial]
+#[test]
+fn grammar_with_a_null_byte_is_rejected() {
+    // The other panic path in the binding: `CString::new` on a string with an
+    // interior null byte.
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let err = client
+        .complete(Request::new("hi").with_grammar("root ::= \"a\"\0"))
+        .expect_err("a null byte must be rejected");
+    assert!(matches!(err, LlamaError::Protocol(_)), "got {err:?}");
+}
+
+#[serial]
+#[test]
+fn unknown_grammar_root_is_rejected() {
+    let client = Client::new(model_230m()).expect("load 230M model");
+    let err = client
+        .complete(
+            Request::new("hi")
+                .with_grammar(CHOICE_GRAMMAR)
+                .with_grammar_root("nonexistent"),
+        )
+        .expect_err("an unknown start rule must be rejected");
+    assert!(matches!(err, LlamaError::Protocol(_)), "got {err:?}");
+}
+
 // ─── Sampling seed ─────────────────────────────────────────────────────────
 
 #[serial]

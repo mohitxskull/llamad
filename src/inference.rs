@@ -15,7 +15,7 @@ use std::thread;
 use llama_cpp_4::prelude::*;
 
 use crate::preprocess::preprocess_loop;
-use crate::protocol::{InferCmd, InferResult, LlamaError, PreparedCmd, SamplingParams};
+use crate::protocol::{Grammar, InferCmd, InferResult, LlamaError, PreparedCmd, SamplingParams};
 
 type Result<T> = std::result::Result<T, LlamaError>;
 
@@ -356,29 +356,87 @@ fn sampler_chain(params: SamplingParams) -> Vec<SamplerKind> {
     }
 }
 
-fn build_sampler(params: SamplingParams) -> LlamaSampler {
-    let chain = sampler_chain(params);
-    if chain.is_empty() {
-        LlamaSampler::greedy()
-    } else {
-        LlamaSampler::chain_simple(chain.into_iter().map(SamplerKind::into_sampler))
+/// Build a grammar sampler, turning llama.cpp's failure modes into an error.
+///
+/// [`LlamaSampler::grammar`] **panics** twice over: `CString::new` panics on a
+/// null byte in either string, and llama.cpp returns a null pointer for a
+/// grammar that does not parse, which the binding unwraps. Both are reachable
+/// from untrusted socket input, and a panic on the inference thread would take
+/// the engine down for every client — a malformed grammar from one caller must
+/// not be a denial of service for the rest.
+///
+/// Catching the unwind is sound here: this is a constructor, so a panic means
+/// llama.cpp allocated nothing and no state was mutated. The default panic
+/// hook still prints to stderr before unwinding, so a rejected grammar is
+/// noisy in the log even though it is handled. Requires `panic = "unwind"`
+/// (the default); under `panic = "abort"` a bad grammar aborts the process.
+pub(crate) fn build_grammar_sampler(
+    model: &LlamaModel,
+    grammar: &str,
+    root: &str,
+) -> Result<LlamaSampler> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        LlamaSampler::grammar(model, grammar, root)
+    }))
+    .map_err(|_| {
+        LlamaError::Protocol(format!(
+            "grammar failed to compile (start rule {root:?}); check the GBNF syntax"
+        ))
+    })
+}
+
+/// Assemble the sampler for one request.
+///
+/// # Errors
+///
+/// [`LlamaError::Protocol`] if a supplied grammar does not compile.
+fn build_sampler(
+    model: &LlamaModel,
+    params: SamplingParams,
+    grammar: Option<&Grammar>,
+) -> Result<LlamaSampler> {
+    let mut samplers: Vec<LlamaSampler> = Vec::new();
+
+    // Grammar goes first, and the order is load-bearing. It masks disallowed
+    // tokens to -inf so every later stage picks only from the allowed set.
+    // Placed after top-k/top-p it could mask away the entire truncated
+    // candidate set; placed after `Dist` it would do nothing at all, since the
+    // token is already chosen.
+    if let Some(g) = grammar {
+        samplers.push(build_grammar_sampler(model, &g.text, &g.root)?);
     }
+
+    let kinds = sampler_chain(params);
+    // An empty chain means temperature <= 0, i.e. greedy decoding.
+    let greedy = kinds.is_empty();
+    samplers.extend(kinds.into_iter().map(SamplerKind::into_sampler));
+    if greedy {
+        // Greedy is the chain's *tail*, not the whole sampler: with a grammar
+        // present the mask has to run first. A lone grammar sampler would
+        // never select a token.
+        samplers.push(LlamaSampler::greedy());
+    }
+
+    Ok(LlamaSampler::chain_simple(samplers))
 }
 
 // ── Slot creation ─────────────────────────────────────────────────────────────
 
+/// Assemble a slot from a prepared request and an already-built sampler.
+///
+/// The sampler is built by the caller rather than here so that a grammar
+/// failure can be reported to the client *before* the response channels are
+/// moved into the slot.
 fn create_slot(
     tokens: Vec<LlamaToken>,
     max_gen: u32,
-    sampling: SamplingParams,
+    sampler: LlamaSampler,
     stop: Vec<String>,
     resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
     token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
 ) -> Slot {
     let n_prompt = tokens.len();
-
-    let sampler = build_sampler(sampling);
     let stop_max_len = stop.iter().map(String::len).max().unwrap_or(0);
 
     Slot {
@@ -489,71 +547,82 @@ fn select_slot(
         .map(|(i, _)| i)
 }
 
+/// Report `err` to whichever response channels a request carried.
+fn reject(
+    err: LlamaError,
+    resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
+    token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
+) {
+    if let Some(resp) = resp {
+        let _ = resp.send(Err(err.clone()));
+    }
+    if let Some(done) = done_tx {
+        let _ = done.send(Err(err));
+    }
+    drop(token_tx);
+}
+
 fn fill_empty_slot(
+    model: &LlamaModel,
     ctx: &mut LlamaContext,
     slots: &mut [Option<Slot>],
     slot_cache: &mut [Vec<LlamaToken>],
     cmd: PreparedCmd,
 ) {
-    // Destructured by value, and before slot selection: cloning `tokens` here
+    // Destructured by value, and before slot selection: cloning `req.tokens`
     // would copy the whole tokenized prompt on every request, and
     // `select_slot` needs them to score each free slot's cached prefix.
-    let (tokens, max_gen, sampling, stop, resp, token_tx, done_tx) = match cmd {
-        PreparedCmd::Run {
-            tokens,
-            max_gen,
-            sampling,
-            stop,
-            resp,
-        } => (tokens, max_gen, sampling, stop, Some(resp), None, None),
+    let (req, resp, token_tx, done_tx) = match cmd {
+        PreparedCmd::Run { req, resp } => (req, Some(resp), None, None),
         PreparedCmd::RunStream {
-            tokens,
-            max_gen,
-            sampling,
-            stop,
+            req,
             token_tx,
             done_tx,
-        } => (
-            tokens,
-            max_gen,
-            sampling,
-            stop,
-            None,
-            Some(token_tx),
-            done_tx,
-        ),
+        } => (req, None, Some(token_tx), done_tx),
         PreparedCmd::Shutdown => {
             tracing::warn!("Shutdown received outside of main loop");
             return;
         }
     };
 
-    let idx = match select_slot(slots, slot_cache, &tokens) {
+    // Built before the slot is claimed so a failure costs nothing. The
+    // preprocess thread already validated any grammar against this same
+    // vocabulary, so this error path is defence in depth rather than the
+    // primary check — but it must not panic the inference thread either way.
+    let sampler = match build_sampler(model, req.sampling, req.grammar.as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("sampler construction failed: {e}");
+            reject(e, resp, token_tx, done_tx);
+            return;
+        }
+    };
+
+    let idx = match select_slot(slots, slot_cache, &req.tokens) {
         Some(i) => i,
         None => {
             tracing::warn!("All slots full, dropping request");
-            let err = LlamaError::Inference("all slots busy, try again later".into());
-            if let Some(resp) = resp {
-                let _ = resp.send(Err(err.clone()));
-            }
-            if let Some(done) = done_tx {
-                let _ = done.send(Err(err));
-            }
-            drop(token_tx);
+            reject(
+                LlamaError::Inference("all slots busy, try again later".into()),
+                resp,
+                token_tx,
+                done_tx,
+            );
             return;
         }
     };
     let mut slot = create_slot(
         Vec::new(),
-        max_gen,
-        sampling,
-        stop,
+        req.max_gen,
+        sampler,
+        req.stop,
         resp,
         token_tx,
         done_tx,
     );
     let cached = std::mem::take(&mut slot_cache[idx]);
-    let lcp = slot.begin_request(tokens, cached);
+    let lcp = slot.begin_request(req.tokens, cached);
     if lcp > 0 {
         // Drop the old tail beyond the shared prefix; the prefill below
         // rewrites [kv_pos, n_prompt) anyway, so clearing from lcp covers
@@ -795,7 +864,7 @@ fn inference_loop(
                     cancel_all(&mut slots, &mut slot_cache, LlamaError::InferenceCrashed);
                     return;
                 }
-                Ok(cmd) => fill_empty_slot(&mut ctx, &mut slots, &mut slot_cache, cmd),
+                Ok(cmd) => fill_empty_slot(&model, &mut ctx, &mut slots, &mut slot_cache, cmd),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             }
@@ -809,7 +878,7 @@ fn inference_loop(
                     tracing::info!("Shutdown received");
                     return;
                 }
-                Ok(cmd) => fill_empty_slot(&mut ctx, &mut slots, &mut slot_cache, cmd),
+                Ok(cmd) => fill_empty_slot(&model, &mut ctx, &mut slots, &mut slot_cache, cmd),
                 Err(_) => return,
             }
             continue;
@@ -980,8 +1049,16 @@ fn inference_loop(
                 }
             };
 
+            // No explicit `accept` here: `llama_sampler_sample` already calls
+            // `llama_sampler_accept` on the chain before returning (see
+            // llama-sampler.cpp, and the binding's own "Sample and accept a
+            // token" doc). Calling it again advanced every stateful sampler
+            // twice per token — double-counting each token in the repetition
+            // penalty's history, and, once a grammar is in the chain, driving
+            // the grammar two steps per token until its stack empties, at
+            // which point llama.cpp throws a C++ exception that unwinds
+            // through the thread boundary and aborts the process.
             let token = slot.sampler.sample(&ctx, batch_idx);
-            slot.sampler.accept(token);
 
             if model.is_eog_token(token) {
                 slot.finish();
@@ -1710,20 +1787,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sampler_chain_branch_constructs() {
-        // Smoke: the FFI chain construction for every sampler kind (the
-        // greedy branch is already exercised by the slot tests above).
-        let sampler = build_sampler(default_params());
-        drop(sampler);
-    }
-
-    #[test]
-    fn test_build_sampler_greedy_branch_constructs() {
-        let sampler = build_sampler(SamplingParams {
-            temperature: 0.0,
-            ..default_params()
-        });
-        drop(sampler);
+    fn test_sampler_kinds_construct_over_ffi() {
+        // Smoke: every `SamplerKind` builds a real llama.cpp sampler. This is
+        // the part of `build_sampler` that needs no model; the grammar branch
+        // and the full assembly are covered by the real-model tests in
+        // `tests/integration.rs`, since `LlamaSampler::grammar` needs a
+        // vocabulary.
+        for kind in sampler_chain(default_params()) {
+            drop(kind.into_sampler());
+        }
+        drop(LlamaSampler::greedy());
     }
 
     // ── longest_common_prefix ────────────────────────────────────────────────

@@ -65,6 +65,16 @@ First public release. Everything below is new.
   clamped into range rather than rejected, and `NaN` falls back to the default.
 - `seed` defaults to a fresh random seed per request, so two identical requests
   at a non-zero temperature return different text. Pin it for reproducibility.
+- Grammar-constrained generation: `grammar` (GBNF) masks disallowed tokens
+  ahead of every other sampling stage, so output is guaranteed to parse —
+  the reliable way to get structured output from a small model.
+  `grammar_root` selects the start rule, defaulting to `"root"`. Grammars are
+  compiled and validated on the preprocess thread, so a malformed one fails
+  that single request with `LlamaError::Protocol` instead of reaching the
+  inference thread: `LlamaSampler::grammar` panics on unparseable GBNF and on
+  null bytes, and grammars arrive over the socket, so an unguarded panic would
+  have been a remote kill of the whole engine. GBNF only — no JSON-Schema
+  converter, which `llama-cpp-4` does not provide.
 - Stop sequences: `stop` ends generation as soon as any entry appears, and the
   matched text is excluded from the result. A stop sequence may span token
   boundaries — output that could still grow into one is withheld from the
@@ -73,8 +83,15 @@ First public release. Everything below is new.
   added latency.
 - Per-slot token budgets, incremental UTF-8 assembly across token boundaries,
   and cancellation that frees a slot as soon as a streaming client goes away.
-- Sampler chain order: penalties → top-k → top-p → temperature →
-  distribution, replaced entirely by a greedy sampler at temperature ≤ 0.
+- Sampler chain order: grammar → penalties → top-k → top-p → temperature →
+  distribution. Greedy decoding (temperature ≤ 0) replaces the sampling tail
+  but still runs behind the grammar mask.
+- Tokens are accepted into the sampler exactly once. `llama_sampler_sample`
+  already accepts internally, so the additional explicit `accept` advanced
+  every stateful sampler twice per token — double-counting each token in the
+  repetition penalty's history, and (once grammars existed) stepping the
+  grammar twice per token until its stack emptied and llama.cpp threw a C++
+  exception that aborted the process from across the FFI boundary.
 
 **Daemon**
 
@@ -109,5 +126,5 @@ First public release. Everything below is new.
 
 - Tested against the Liquid AI LFM2.5 family; KV-prefix reuse additionally
   exercised against pure-attention models (SmolLM2, Qwen2.5).
-- 141 unit tests, 24 real-model tests, 4 doc tests. CI runs clippy and
+- 140 unit tests, 30 real-model tests, 4 doc tests. CI runs clippy and
   rustdoc at `-D warnings`.

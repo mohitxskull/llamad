@@ -104,6 +104,23 @@ pub struct Request {
     /// (`temperature <= 0`), which is deterministic regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u32>,
+    /// A GBNF grammar constraining generation.
+    ///
+    /// Tokens the grammar disallows are masked before any other sampling
+    /// stage, so output is guaranteed to parse. This is the reliable way to
+    /// get structured output (JSON, a fixed vocabulary, a tool-call envelope)
+    /// out of a small model, which will otherwise drift out of format.
+    ///
+    /// A grammar that does not parse is rejected with
+    /// [`LlamaError::Protocol`] — it is never silently ignored, because
+    /// unconstrained output from a request that asked to be constrained is
+    /// worse than an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+    /// Which grammar rule to start from. Defaults to `"root"`, the GBNF
+    /// convention. Ignored when `grammar` is unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar_root: Option<String>,
     /// Strings that end generation as soon as one appears in the output.
     ///
     /// The matched stop text is **not** included in the returned completion,
@@ -231,6 +248,21 @@ impl Request {
         self
     }
 
+    /// Constrain generation to a GBNF grammar, starting from rule `"root"`.
+    #[must_use]
+    pub fn with_grammar(mut self, grammar: impl Into<String>) -> Self {
+        self.grammar = Some(grammar.into());
+        self
+    }
+
+    /// Set the grammar's start rule. Only meaningful alongside
+    /// [`with_grammar`](Self::with_grammar).
+    #[must_use]
+    pub fn with_grammar_root(mut self, root: impl Into<String>) -> Self {
+        self.grammar_root = Some(root.into());
+        self
+    }
+
     /// Replace the stop sequences. Generation ends as soon as one appears,
     /// and the matched text is excluded from the completion.
     #[must_use]
@@ -326,22 +358,34 @@ pub(crate) struct SamplingParams {
     pub seed: u32,
 }
 
-/// A fully-prepared inference command: the prompt is already templated,
-/// tokenized, and budget-checked, and the sampling parameters are resolved
-/// and clamped. Sent from the preprocess thread to the inference thread.
+/// A GBNF grammar and the rule generation starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Grammar {
+    pub text: String,
+    pub root: String,
+}
+
+/// A request that has cleared preprocessing: templated, tokenized and
+/// budget-checked, with sampling resolved and clamped, stop sequences
+/// normalized, and any grammar already validated against the model's
+/// vocabulary.
+pub(crate) struct PreparedRequest {
+    pub tokens: Vec<LlamaToken>,
+    pub max_gen: u32,
+    pub sampling: SamplingParams,
+    pub grammar: Option<Grammar>,
+    pub stop: Vec<String>,
+}
+
+/// A fully-prepared inference command, sent from the preprocess thread to the
+/// inference thread.
 pub(crate) enum PreparedCmd {
     Run {
-        tokens: Vec<LlamaToken>,
-        max_gen: u32,
-        sampling: SamplingParams,
-        stop: Vec<String>,
+        req: PreparedRequest,
         resp: oneshot::Sender<Result<InferResult, LlamaError>>,
     },
     RunStream {
-        tokens: Vec<LlamaToken>,
-        max_gen: u32,
-        sampling: SamplingParams,
-        stop: Vec<String>,
+        req: PreparedRequest,
         token_tx: tokio::sync::mpsc::UnboundedSender<String>,
         done_tx: Option<tokio::sync::oneshot::Sender<Result<InferResult, LlamaError>>>,
     },

@@ -79,6 +79,18 @@ required-features = ["bin"]
 [profile.dev.package."*"]
 opt-level = 2
 
+[package.metadata.docs.rs]
+# Drop the `bin` feature: the daemon's argument/logging dependencies add
+# nothing to the API docs, and fewer dependencies means a better chance of
+# finishing inside the docs.rs time limit. No acceleration backend is selected
+# either — the docs.rs sandbox has no CUDA/Metal/ROCm toolchain.
+#
+# This is still a full llama.cpp C++ build from source via llama-cpp-sys-4, so
+# the docs build is heavy and may time out. Verify the docs render after the
+# first publish; if they do not, host them separately rather than weakening the
+# crate's dependencies for the sake of docs.rs.
+no-default-features = true
+
 [lints.clippy]
 # `warn`, not `deny`: a future clippy release that adds a lint must not break
 # downstream builds. CI runs `cargo clippy -- -D warnings` to keep this clean.

@@ -9,20 +9,53 @@ let client = Client::new("/path/to/model.gguf")?;
 let text = client.complete_text("tell me a joke")?;
 ```
 
-**Scope.** llamad is a **CPU-first** inference library for embedding a local
-GGUF model directly in a Rust program. It gives you a working decode loop —
-slotted batching, streaming, cancellation, KV-prefix reuse, UTF-8 assembly
-across token boundaries — so you do not write one against raw llama.cpp
-bindings. It is not a serving stack: no HTTP, no OpenAI-compatible endpoint, no
-model registry, no GPU story (see [Acceleration features](#acceleration-features)).
+**llamad is a CPU-first inference library for embedding a local GGUF model
+directly in a Rust program.** It gives you a finished decode loop — slotted
+batching, streaming, drop-to-cancel, KV-prefix reuse, grammar-constrained
+output, stop sequences, UTF-8 assembly across token boundaries — so you do not
+write one against raw llama.cpp bindings.
 
-Reach for it when the inference belongs *inside* your process: CLI tools,
-desktop apps, editor and shell integrations, batch/offline pipelines,
-privacy-sensitive local processing, tests that need a real model without a GPU
-or a network. Reach for [Ollama](https://github.com/ollama/ollama) or
-[llama.cpp's server](https://github.com/ggml-org/llama.cpp) instead when you
-want a managed daemon, GPU offload, or an HTTP API — those are different tools,
-not worse ones.
+## Where this fits
+
+The Rust ecosystem makes you pick one of two bad options for local inference.
+Bindings like [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) hand you
+primitives and leave the decode loop to you — batch management, slot
+scheduling, KV bookkeeping, cancellation, partial-UTF-8 reassembly. That loop
+is small to sketch and unpleasant to get right. The alternative is a
+server — [Ollama](https://github.com/ollama/ollama),
+[llama.cpp's `llama-server`](https://github.com/ggml-org/llama.cpp) — which
+means a second process to install, supervise and version, plus an HTTP hop for
+inference that was always going to run on the same machine.
+
+llamad is the middle: the scheduler and the loop, as a library call, in your
+process.
+
+| | llamad | `llama-cpp-2` / `-4` | Ollama / `llama-server` | [`mistral.rs`](https://github.com/EricLBuehler/mistral.rs) |
+|---|---|---|---|---|
+| Runs in your process | yes | yes | no — separate daemon | yes (heavier) |
+| Decode loop written for you | yes | **no** — you write it | yes | yes |
+| Continuous batching | yes | no | yes | yes |
+| Transport | in-process channels; optional UDS | none | HTTP | in-process / HTTP |
+| Primary target | **CPU** | either | either, GPU-leaning | GPU-leaning |
+| Grammar-constrained output | yes | via raw sampler | yes | yes |
+| GPU | untested pass-through | yes | yes | yes |
+| Model management | local paths | local paths | registry, pull, hot-swap | HF Hub |
+| Dependency weight | llama.cpp + tokio | llama.cpp | external binary | large |
+
+**Use llamad when** the inference belongs inside your program: CLI tools,
+desktop apps, editor and shell integrations, batch and offline pipelines,
+privacy-sensitive local processing, and test suites that want a real model
+without a GPU or a network.
+
+**Use something else when** you want GPU offload, a model registry with
+hot-swap, an OpenAI-compatible HTTP API, or multi-tenant serving. Ollama and
+`llama-server` are better at all of those, and this is not trying to compete
+with them.
+
+**Not included, deliberately:** HTTP, an OpenAI-compatible endpoint, a model
+registry, LoRA, speculative decoding, embeddings/rerank, vision, and paged KV.
+See [Design tradeoffs](#design-tradeoffs) for the ones that are load-bearing
+rather than merely absent.
 
 ## Architecture
 
@@ -324,9 +357,13 @@ starting point for the bundled models, not a policy imposed on every GGUF:
 | `repeat_penalty` | 1.05 | clamped `[0, 2]`; `1.0` disables |
 | `repeat_last_n` | -1 (whole context) | clamped `>= -1`; `0` disables the lookback |
 | `seed` | a fresh random seed per request | any `u32` |
+| `grammar` | none | GBNF text; see [Grammar-constrained output](#grammar-constrained-output) |
+| `grammar_root` | `"root"` | grammar start rule; ignored without `grammar` |
 | `max_tokens` | 256 | further capped by the per-slot budget |
 
-Sampler chain: penalties → top-k → top-p → temperature → distribution. When
+Sampler chain: grammar → penalties → top-k → top-p → temperature →
+distribution. Grammar is first so every later stage picks only from the allowed
+set. When
 `temperature <= 0` a greedy sampler replaces the chain entirely, and the other
 sampling fields do not apply.
 
@@ -347,6 +384,37 @@ let req = Request::new("invent a sentence")
 
 Greedy decoding (`temperature <= 0`) is deterministic regardless and ignores
 the seed.
+
+### Grammar-constrained output
+
+A GBNF grammar masks disallowed tokens before every other sampling stage, so
+output is guaranteed to parse. This is the reliable way to get structured
+output from a small model, which will otherwise drift out of format:
+
+```rust
+let req = Request::new("Reply with a JSON object having key ok.")
+    .with_grammar(r#"
+root ::= "{" ws "\"ok\"" ws ":" ws bool ws "}"
+bool ::= "true" | "false"
+ws   ::= " "?
+"#);
+```
+
+`grammar_root` selects the start rule and defaults to `"root"`. A grammar that
+does not compile is rejected with `LlamaError::Protocol` — never silently
+ignored, since unconstrained output from a request that asked to be constrained
+is worse than an error. Grammars are validated on the preprocess thread, so a
+malformed one fails that single request and leaves the engine serving.
+
+Grammars are GBNF only; there is no JSON-Schema-to-GBNF converter in this crate
+(`llama-cpp-4` does not expose one). Generate the GBNF with an external tool if
+you are starting from a schema.
+
+**Write grammars permissively at the start.** If a grammar cannot match
+anything the model wants to emit — a common cause is forbidding the leading
+space or newline most chat models produce — llama.cpp can be left with no legal
+token. Allowing optional leading whitespace (`root ::= [ \n]* ...`) avoids the
+usual case.
 
 ### Stop sequences
 
@@ -438,7 +506,7 @@ cargo test --test reuse               # KV-prefix-reuse path tests (attention mo
 cargo test --test cancellation        # slot-recycling cancellation test
 ```
 
-141 unit tests + 24 real-model tests (15 in `tests/integration.rs`, 5 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 4 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
+140 unit tests + 30 real-model tests (21 in `tests/integration.rs`, 5 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 4 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
 
 ### KV-reuse path (`LLAMAD_TEST_MODEL` / bundled SmolLM2)
 
@@ -449,12 +517,12 @@ The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages o
 | Area | Tests | Description |
 |---|---|---|
 | Protocol | 17 | Deserialization, serialization round-trip, null-byte rejection, history |
-| Preprocess | 29 | Chat templating (`build_messages`), sampling resolution and clamping, stop-sequence normalization, budget checks, defaults |
-| Slot lifecycle + KV reuse | 52 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
+| Preprocess | 29 | Chat templating (`build_messages`), sampling resolution and clamping, grammar validation, stop-sequence normalization, budget checks, defaults |
+| Slot lifecycle + KV reuse | 51 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
 | Client API | 15 | complete/complete_stream, async variants, error propagation, done-signal ordering, `Send + Sync` guard |
 | Server | 15 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, size cap, error responses |
 | Config | 13 | Env parsing, defaults, `sane()` clamping, true-spelling flip-from-disabled |
-| Integration | 15 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility |
+| Integration | 21 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility, grammar constraint (sampled + greedy + JSON) and rejection of malformed/null-byte/unknown-root grammars without killing the engine |
 | Lifecycle | 5 | Real model: two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
 | KV reuse e2e | 3 | Real model (attention, `tests/reuse.rs`): identical resend, partial-prefix triple, reuse-engages probe verdict |
 | Cancellation | 1 | Single-slot server: slot recycled after stream drop (bounded first-token wait) |
