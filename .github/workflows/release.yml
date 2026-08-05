@@ -1,0 +1,68 @@
+name: Release
+
+# Tagging `vX.Y.Z` publishes a GitHub Release whose notes are generated from
+# the Conventional Commits since the previous tag.
+#
+# Publishing to crates.io is deliberately NOT automated: a released version
+# can be yanked but never replaced, so it stays a manual `cargo publish`.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Refuse to release if the tag and the manifest disagree — the most
+      # common release mistake, and silent if unchecked.
+      - name: Tag matches Cargo.toml version
+        run: |
+          manifest="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+          echo "version $manifest"
+
+      - name: Tests
+        run: cargo test --lib --doc
+
+      - name: Package
+        run: cargo package
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs full history and tags
+
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          # Pre-1.0 and pre-release tags are marked as such.
+          prerelease: ${{ contains(github.ref_name, '-') }}

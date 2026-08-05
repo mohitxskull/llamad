@@ -1,0 +1,85 @@
+[package]
+name = "llamad"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "General-purpose GGUF model daemon: slotted KV-cache batching, prefix reuse, streaming, Unix-socket server"
+repository = "https://github.com/mohitxskull/llamad"
+readme = "README.md"
+keywords = ["llama", "gguf", "llm", "inference", "daemon"]
+categories = ["api-bindings", "science", "concurrency"]
+# Model fixtures are multi-hundred-MB GGUFs fetched by models/download.sh,
+# which itself ships so a downstream checkout can run the real-model suite.
+exclude = ["models/*.gguf"]
+
+[features]
+# `bin` is on by default so `cargo run -- model.gguf` works in a checkout.
+# Library consumers should set `default-features = false` to drop the daemon's
+# argument/logging dependencies.
+#
+# No acceleration backend is enabled by default: the resulting build is
+# portable to any machine with the same target triple. Every backend below is
+# opt-in because each one either pins the binary to the build host (`native`)
+# or requires a matching toolchain/driver on the build machine.
+default = ["bin"]
+
+# Extra dependencies for the daemon binary (src/main.rs).
+bin = [
+    "dep:anyhow",
+    "dep:tracing-subscriber",
+    "tokio/rt-multi-thread",
+    "tokio/macros",
+    "tokio/signal",
+]
+
+# `-march=native`: enables host-specific SIMD (AVX-512/AVX2/FMA). Substantially
+# faster, but the resulting binary may SIGILL on any other CPU model.
+native = ["llama-cpp-4/native"]
+# OpenMP threading inside ggml (llama-cpp-4 enables this in its own defaults;
+# opt-in here so the default build needs no external toolchain).
+openmp = ["llama-cpp-4/openmp"]
+# Download a prebuilt generic x86-64 ggml instead of compiling llama.cpp.
+prebuilt = ["llama-cpp-4/prebuilt"]
+cuda = ["llama-cpp-4/cuda"]
+metal = ["llama-cpp-4/metal"]
+vulkan = ["llama-cpp-4/vulkan"]
+hip = ["llama-cpp-4/hip"]
+blas = ["llama-cpp-4/blas"]
+
+[dependencies]
+llama-cpp-4 = { version = "0.4.4", default-features = false }
+# Only for the `ggml_log_level` type and its level constants in the tracing log
+# callback; the `llama_log_set` call itself goes through `llama_cpp_4::log_set`.
+# Resolves to the same version llama-cpp-4 depends on (both require ^0.4.4).
+llama-cpp-sys-4 = { version = "0.4.4", default-features = false }
+tokio = { version = "1", features = ["net", "sync", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+num_cpus = "1"
+
+# Binary-only. Gated behind `bin` so a library consumer does not pull an error
+# wrapper and a log subscriber into its dependency graph.
+anyhow = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+], optional = true }
+
+[[bin]]
+name = "llamad"
+path = "src/main.rs"
+required-features = ["bin"]
+
+[lints.clippy]
+# `warn`, not `deny`: a future clippy release that adds a lint must not break
+# downstream builds. CI runs `cargo clippy -- -D warnings` to keep this clean.
+all = "warn"
+
+[workspace]
+
+[dev-dependencies]
+serial_test = "4.0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check --all
+
+      # No acceleration feature: `native` would build for the runner's CPU,
+      # and the runner fleet is heterogeneous. This is also the configuration
+      # downstream consumers get by default.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+      # Real-model tests need ~1.4 GB of GGUFs; the unit suite covers the
+      # protocol, slot lifecycle, KV-reuse bookkeeping, config and server
+      # without loading a model.
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      # Compile (but do not run) the real-model test binaries, so an API
+      # change that breaks them fails here rather than at release time.
+      - name: Build integration test binaries
+        run: cargo test --no-run --all-targets
+
+      - name: Package
+        run: cargo package
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check against the declared MSRV
+        run: cargo check --all-targets
