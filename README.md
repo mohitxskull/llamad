@@ -9,6 +9,21 @@ let client = Client::new("/path/to/model.gguf")?;
 let text = client.complete_text("tell me a joke")?;
 ```
 
+**Scope.** llamad is a **CPU-first** inference library for embedding a local
+GGUF model directly in a Rust program. It gives you a working decode loop —
+slotted batching, streaming, cancellation, KV-prefix reuse, UTF-8 assembly
+across token boundaries — so you do not write one against raw llama.cpp
+bindings. It is not a serving stack: no HTTP, no OpenAI-compatible endpoint, no
+model registry, no GPU story (see [Acceleration features](#acceleration-features)).
+
+Reach for it when the inference belongs *inside* your process: CLI tools,
+desktop apps, editor and shell integrations, batch/offline pipelines,
+privacy-sensitive local processing, tests that need a real model without a GPU
+or a network. Reach for [Ollama](https://github.com/ollama/ollama) or
+[llama.cpp's server](https://github.com/ggml-org/llama.cpp) instead when you
+want a managed daemon, GPU offload, or an HTTP API — those are different tools,
+not worse ones.
+
 ## Architecture
 
 A `Client` owns an `Engine`: one loaded model plus two threads. Inference runs
@@ -242,18 +257,38 @@ Streaming errors propagate through `done_tx` (`oneshot::Sender<Result<InferResul
 No backend is enabled by default, so a stock `cargo build` produces a binary
 that runs on any machine with the same target triple. Opt in per deployment:
 
-| Feature | Effect |
-|---|---|
-| `native` | Builds llama.cpp with `-march=native` — enables AVX-512/AVX2/FMA for the LFM2.5 GQA attention kernels. Fastest, but the binary may `SIGILL` on any other CPU model. |
-| `openmp` | OpenMP threading inside ggml. |
-| `prebuilt` | Downloads a prebuilt generic x86-64 ggml instead of compiling llama.cpp. Much faster to build; no arch-specific SIMD. |
-| `cuda`, `metal`, `vulkan`, `hip`, `blas` | Forwarded to the corresponding `llama-cpp-4` feature. |
+| Feature | Effect | Status |
+|---|---|---|
+| `native` | Builds llama.cpp with `-march=native` — enables AVX-512/AVX2/FMA. Fastest, but the binary may `SIGILL` on any other CPU model. | Tested; all benchmarks below use it |
+| `openmp` | OpenMP threading inside ggml. | Builds; not benchmarked |
+| `prebuilt` | Downloads a prebuilt generic x86-64 ggml instead of compiling llama.cpp. Much faster to build; no arch-specific SIMD. | Builds; not benchmarked |
+| `cuda`, `metal`, `vulkan`, `hip`, `blas` | Forwarded verbatim to the corresponding `llama-cpp-4` feature. | **Untested — see below** |
 
-The benchmark numbers below were measured with `--features native`.
+**The GPU and BLAS features are unverified.** They are pass-through flags to
+`llama-cpp-4`; nothing in this repo builds, runs, or benchmarks them, and CI
+does not cover them. They are exposed because forwarding a feature costs
+nothing and blocking it would help no one — not because llamad is known to work
+on a GPU. If you enable one and it works, that is llama.cpp working; if it
+breaks, the bug is as likely to be here as upstream. Reports welcome.
+
+llamad is developed and tested as a **CPU inference library**. Everything below
+— the throughput figures, the thread defaults, the slot budgets — was measured
+and tuned on CPU.
 
 ## Supported models
 
-Tested with the **Liquid AI LFM2.5 family** (all available as GGUF on HuggingFace at `LiquidAI/<model-name>-GGUF`). The real-model test suite needs the GGUFs in `models/` (gitignored) — fetch them with `models/download.sh` (also grabs SmolLM2-135M and Qwen2.5-0.5B, the attention-only models used by the KV-reuse tests):
+Any GGUF that llama.cpp can load and that carries a chat template. The loader,
+sampler and decode loop are model-agnostic; nothing in the crate is specific to
+one family. Sampling **defaults** happen to be the Liquid AI LFM2.5 model-card
+values, and every one of them is overridable per request (see
+[Generation parameters](#generation-parameters)).
+
+What is *tested* is narrower: the LFM2.5 family plus SmolLM2-135M and
+Qwen2.5-0.5B (attention-only, used by the KV-reuse tests). KV-prefix reuse is
+probe-gated per model and degrades to full prefill on architectures that cannot
+partially rewind their KV cache — hybrid/SSM models like LFM2.5 take that path.
+The real-model test suite needs the GGUFs in `models/` (gitignored) — fetch
+them with `models/download.sh`:
 
 | Model | Params | Q4 size | Use case | Speed (i5-1135G7, 4 threads) |
 |---|---|---|---|---|
