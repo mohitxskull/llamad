@@ -53,6 +53,20 @@ hot-swap, an OpenAI-compatible HTTP API, or multi-tenant serving. Ollama and
 `llama-server` are better at all of those, and this is not trying to compete
 with them.
 
+**When you do need a process boundary, it costs nothing measurable.** The
+daemon speaks JSON over a Unix socket rather than HTTP, and the round trip
+disappears into the noise: across three runs of 60 single-token requests
+against the 230M model, the median difference between the socket path and the
+in-process path was 13 ms, 1.7 ms, and — on the third run — negative, with the
+socket marginally ahead. That spread is measurement noise on a ~270 ms request,
+not a transport cost. Against a real multi-second generation it is not worth
+thinking about.
+
+The reason to prefer a Unix socket here is not throughput, it is that there is
+no network surface to get wrong: no port to allocate, no firewall rule, no
+accidental bind to `0.0.0.0`. Access is filesystem permissions — the socket is
+`0600` — instead of a network ACL.
+
 **Not included, deliberately:** HTTP, an OpenAI-compatible endpoint, a model
 registry with lazy loading or eviction (several models at once is just several
 clients — see [Running more than one model](#running-more-than-one-model)), LoRA, speculative decoding, embeddings/rerank, vision, and paged KV.
