@@ -35,6 +35,12 @@ First public release. Everything below is new.
   hand-rolled JSON.
 - `Client` is `Send + Sync`, so `Arc<Client>` serves concurrent requests from
   one model.
+- `Client::with_config` / `Engine::start_with_config` take an
+  `InferenceConfig` directly, bypassing the environment. Needed by any process
+  running more than one model: `LLAMAD_*` is process-global, so the env-based
+  constructors give a small routing model and a large reasoning model the same
+  context and thread budget. Hand-built configs are clamped, not trusted — the
+  struct's fields are public and `n_slots: 0` would otherwise divide by zero.
 
 **Inference**
 
@@ -109,7 +115,13 @@ First public release. Everything below is new.
   `LLAMAD_N_THREADS_BATCH`, `LLAMAD_KV_CACHE`, all range-clamped so a bad
   value degrades instead of panicking.
 - Thread counts default to physical cores rather than logical, avoiding
-  hyperthread collapse.
+  hyperthread collapse. A process running several engines should divide the
+  cores between them explicitly — each engine otherwise claims all of them,
+  and ggml's workers spin.
+- `n_ctx` is floored at 2 as well as at `n_slots`. `n_batch` is set to `n_ctx`
+  and llama.cpp hard-asserts `n_tokens_all <= n_batch`, so a smaller context
+  aborted the process on the startup KV-rewind probe — reachable from
+  `LLAMAD_N_CTX=1` — instead of failing a request.
 
 **Build**
 
@@ -126,5 +138,5 @@ First public release. Everything below is new.
 
 - Tested against the Liquid AI LFM2.5 family; KV-prefix reuse additionally
   exercised against pure-attention models (SmolLM2, Qwen2.5).
-- 140 unit tests, 30 real-model tests, 4 doc tests. CI runs clippy and
+- 142 unit tests, 32 real-model tests, 6 doc tests. CI runs clippy and
   rustdoc at `-D warnings`.

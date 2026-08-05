@@ -5,6 +5,16 @@
 
 use std::env;
 
+/// Smallest context the engine can start with.
+///
+/// The startup KV-rewind probe decodes two tokens, and `n_batch` is set to
+/// `n_ctx`, so anything below this trips llama.cpp's
+/// `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` and aborts the process
+/// rather than failing a request. Nothing useful fits in two tokens either,
+/// but this is a crash floor, not a usefulness floor — a context too small for
+/// a prompt still rejects that prompt cleanly at the budget check.
+const MIN_N_CTX: u32 = 2;
+
 /// Slots, context and thread configuration for a single inference loop.
 ///
 /// The default is **one slot holding the whole context**. Concurrency is
@@ -76,11 +86,22 @@ impl InferenceConfig {
 
     /// Clamp values into usable ranges (never zero/overflowing; caps prevent
     /// truncation-induced div-by-zero and absurd allocations downstream).
-    fn sane(self) -> Self {
+    ///
+    /// Applied to every config an engine starts from, including one a caller
+    /// hand-built and passed to
+    /// [`Engine::start_with_config`](crate::inference::Engine::start_with_config)
+    /// — the struct's fields are public, so the values cannot be assumed sane.
+    pub(crate) fn sane(self) -> Self {
         let n_slots = self.n_slots.clamp(1, 512);
         Self {
             n_slots,
-            n_ctx: self.n_ctx.clamp(n_slots as u32, 1_048_576),
+            // Floored at `MIN_N_CTX` as well as at `n_slots`: `n_batch` is set
+            // to `n_ctx`, and llama.cpp hard-asserts `n_tokens_all <= n_batch`
+            // inside `llama_context::decode`. A smaller context would abort the
+            // process on the startup KV-rewind probe, before any request ran.
+            n_ctx: self
+                .n_ctx
+                .clamp((n_slots as u32).max(MIN_N_CTX), 1_048_576),
             n_threads: self.n_threads.clamp(1, 256),
             n_threads_batch: self.n_threads_batch.clamp(1, 256),
             kv_cache: self.kv_cache,
@@ -222,13 +243,52 @@ mod tests {
             std::env::remove_var("LLAMAD_N_THREADS_BATCH");
         }
         assert_eq!(cfg.n_slots, 1); // "" empty → default
-        assert_eq!(cfg.n_ctx, 1); // 0 clamps up to n_slots
+        assert_eq!(cfg.n_ctx, MIN_N_CTX); // 0 clamps up to the crash floor
         assert_eq!(cfg.n_threads, 1); // 0 clamps to ≥ 1
         assert_eq!(
             cfg.n_threads_batch,
             InferenceConfig::default().n_threads_batch
         ); // "banana" unparsable → default
-        assert_eq!(cfg.per_slot_budget(), 1); // 1 ctx / 1 slot
+        assert_eq!(cfg.per_slot_budget(), 2); // 2 ctx / 1 slot
+    }
+
+    #[test]
+    fn test_n_ctx_never_falls_below_the_batch_assert_floor() {
+        // `n_batch` is set to `n_ctx`, and llama.cpp aborts the process if a
+        // decode exceeds `n_batch`. The startup KV-rewind probe decodes two
+        // tokens, so a context below `MIN_N_CTX` would kill the engine before
+        // it served anything — a crash, not a rejected request.
+        for n_ctx in [0, 1, 2] {
+            let cfg = InferenceConfig {
+                n_slots: 1,
+                n_ctx,
+                n_threads: 1,
+                n_threads_batch: 1,
+                kv_cache: true,
+            }
+            .sane();
+            assert!(
+                cfg.n_ctx >= MIN_N_CTX,
+                "n_ctx {n_ctx} must clamp to at least {MIN_N_CTX}, got {}",
+                cfg.n_ctx
+            );
+        }
+    }
+
+    #[test]
+    fn test_many_slots_still_raise_n_ctx_above_the_floor() {
+        // The floor is a maximum of the two constraints, not a replacement:
+        // with more slots than MIN_N_CTX, n_slots is what binds.
+        let cfg = InferenceConfig {
+            n_slots: 64,
+            n_ctx: 0,
+            n_threads: 1,
+            n_threads_batch: 1,
+            kv_cache: true,
+        }
+        .sane();
+        assert_eq!(cfg.n_ctx, 64);
+        assert_eq!(cfg.per_slot_budget(), 1);
     }
 
     #[test]

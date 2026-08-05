@@ -22,6 +22,17 @@
 //! Engines are independent — several clients with different models can be
 //! alive at once — and each joins its threads on drop.
 //!
+//! # Running several models
+//!
+//! One [`Client`](client::Client) owns one model. For a small routing model
+//! alongside a large reasoning one, construct a client per model with
+//! [`Client::with_config`](client::Client::with_config) and give each its own
+//! context and thread budget — the `LLAMAD_*` variables are process-global, so
+//! [`Client::new`](client::Client::new) would give both the same settings.
+//! Split the machine's cores between them explicitly: every engine otherwise
+//! defaults to all physical cores, and two engines doing that oversubscribe
+//! ggml's spinning worker threads.
+//!
 //! # Blocking and async
 //!
 //! [`Client`](client::Client)'s default methods block the calling thread and
@@ -38,7 +49,9 @@
 //! # Configuration
 //!
 //! Runtime knobs are read from `LLAMAD_*` environment variables — see
-//! [`InferenceConfig`](config::InferenceConfig).
+//! [`InferenceConfig`](config::InferenceConfig). Pass a config explicitly with
+//! [`Client::with_config`](client::Client::with_config) to bypass the
+//! environment, which is what a process running more than one model wants.
 
 #![warn(missing_docs)]
 #![warn(clippy::doc_markdown)]

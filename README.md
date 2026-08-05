@@ -39,7 +39,8 @@ process.
 | Primary target | **CPU** | either | either, GPU-leaning | GPU-leaning |
 | Grammar-constrained output | yes | via raw sampler | yes | yes |
 | GPU | untested pass-through | yes | yes | yes |
-| Model management | local paths | local paths | registry, pull, hot-swap | HF Hub |
+| Multi-model | one `Client` per model, sized independently | manual | registry, pull, hot-swap | multi-pipeline |
+| Model source | local paths | local paths | registry + pull | HF Hub |
 | Dependency weight | llama.cpp + tokio | llama.cpp | external binary | large |
 
 **Use llamad when** the inference belongs inside your program: CLI tools,
@@ -53,7 +54,8 @@ hot-swap, an OpenAI-compatible HTTP API, or multi-tenant serving. Ollama and
 with them.
 
 **Not included, deliberately:** HTTP, an OpenAI-compatible endpoint, a model
-registry, LoRA, speculative decoding, embeddings/rerank, vision, and paged KV.
+registry with lazy loading or eviction (several models at once is just several
+clients — see [Running more than one model](#running-more-than-one-model)), LoRA, speculative decoding, embeddings/rerank, vision, and paged KV.
 See [Design tradeoffs](#design-tradeoffs) for the ones that are load-bearing
 rather than merely absent.
 
@@ -113,6 +115,63 @@ src/
 ├── server.rs      Unix socket server (JSON/NDJSON over UDS)
 └── main.rs        Daemon entry point (requires the `bin` feature, on by default)
 ```
+
+### Running more than one model
+
+A `Client` owns one model. To run several — the common shape is a small fast
+model that routes or classifies, plus a larger one that does the actual
+reasoning — construct one client per model and keep both alive:
+
+```rust
+use llamad::{client::Client, config::InferenceConfig};
+
+// Small router: short context, one thread.
+let router = Client::with_config("LFM2.5-230M-Q4_K_M.gguf", InferenceConfig {
+    n_ctx: 1024,
+    n_threads: 1,
+    n_threads_batch: 1,
+    ..Default::default()
+})?;
+
+// Large thinker: long context, the rest of the cores.
+let thinker = Client::with_config("LFM2.5-1.2B-Thinking-Q4_K_M.gguf", InferenceConfig {
+    n_ctx: 8192,
+    n_threads: 3,
+    n_threads_batch: 3,
+    ..Default::default()
+})?;
+
+let route = router.complete_text("Classify: math, prose, or code? 2+2")?;
+let answer = if route.contains("math") {
+    thinker.complete_text("What is 2+2? Think step by step.")?
+} else {
+    router.complete_text("Reply briefly.")?
+};
+```
+
+Each client is an independent engine: its own model, context, slots and pair
+of threads. They do not share a KV cache and neither can disturb the other's
+slots. Both are `Send + Sync`, so `Arc<Client>` works for concurrent callers.
+
+Two things to get right:
+
+- **Use `with_config`, not `new`.** The `LLAMAD_*` variables are process-global,
+  so `Client::new` gives every model the same context and thread budget. A
+  230M router does not need the 1.2B model's context, and paying for it wastes
+  memory on every slot.
+
+- **Budget threads across models, not per model.** Each engine defaults to
+  `num_cpus::get_physical()` threads. Two engines both defaulting on a 4-core
+  machine means 8 ggml worker threads fighting over 4 cores, and ggml's workers
+  spin — the result is slower than either model alone. Split the cores
+  explicitly, as above. Threads are allocated per engine for the life of the
+  engine, not per request, so this is a decision you make once at construction.
+
+Models stay resident for as long as their client is alive. There is no registry,
+no lazy loading and no eviction: dropping a client unloads its model and joins
+its threads. If you need many models but not all at once, drop and reconstruct —
+loading a small quantized GGUF is fast, and a `Client` is cheap to hold behind
+an `Option`.
 
 ### Design tradeoffs
 
@@ -506,7 +565,7 @@ cargo test --test reuse               # KV-prefix-reuse path tests (attention mo
 cargo test --test cancellation        # slot-recycling cancellation test
 ```
 
-140 unit tests + 30 real-model tests (21 in `tests/integration.rs`, 5 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 4 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
+142 unit tests + 32 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 6 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
 
 ### KV-reuse path (`LLAMAD_TEST_MODEL` / bundled SmolLM2)
 
@@ -521,9 +580,9 @@ The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages o
 | Slot lifecycle + KV reuse | 51 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
 | Client API | 15 | complete/complete_stream, async variants, error propagation, done-signal ordering, `Send + Sync` guard |
 | Server | 15 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, size cap, error responses |
-| Config | 13 | Env parsing, defaults, `sane()` clamping, true-spelling flip-from-disabled |
+| Config | 15 | Env parsing, defaults, `sane()` clamping, true-spelling flip-from-disabled |
 | Integration | 21 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility, grammar constraint (sampled + greedy + JSON) and rejection of malformed/null-byte/unknown-root grammars without killing the engine |
-| Lifecycle | 5 | Real model: two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
+| Lifecycle | 7 | Real model: two models side by side with independent configs, degenerate-config clamping, two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
 | KV reuse e2e | 3 | Real model (attention, `tests/reuse.rs`): identical resend, partial-prefix triple, reuse-engages probe verdict |
 | Cancellation | 1 | Single-slot server: slot recycled after stream drop (bounded first-token wait) |
 

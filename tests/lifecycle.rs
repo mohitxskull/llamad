@@ -17,11 +17,12 @@ use std::time::{Duration, Instant};
 
 use llamad::client::Client;
 use llamad::inference::Engine;
-use llamad::protocol::{InferCmd, Request};
+use llamad::config::InferenceConfig;
+use llamad::protocol::{InferCmd, LlamaError, Request};
 use serial_test::serial;
 
 mod common;
-use common::model_230m;
+use common::{model_1_2b, model_230m};
 
 fn short(text: &str) -> Request {
     Request::new(text).with_max_tokens(8)
@@ -41,6 +42,72 @@ fn within<F: FnOnce() + Send + 'static>(budget: Duration, what: &str, f: F) {
         rx.recv_timeout(budget).is_ok(),
         "{what} did not finish within {budget:?}"
     );
+}
+
+#[serial]
+#[test]
+fn two_models_run_side_by_side_with_independent_configs() {
+    // The small-router + large-thinker pattern. Environment config is
+    // process-global, so `Client::new` would hand both models the same context
+    // and thread budget; `with_config` is what makes them independently
+    // sizable. Thread counts are deliberately under physical cores here —
+    // two engines each defaulting to all cores oversubscribe ggml's workers.
+    let router = Client::with_config(
+        model_230m(),
+        InferenceConfig {
+            n_ctx: 512,
+            n_threads: 1,
+            n_threads_batch: 1,
+            ..Default::default()
+        },
+    )
+    .expect("router client");
+    let thinker = Client::with_config(
+        model_1_2b(),
+        InferenceConfig {
+            n_ctx: 1024,
+            n_threads: 2,
+            n_threads_batch: 2,
+            ..Default::default()
+        },
+    )
+    .expect("thinker client");
+
+    // Both are live at the same time and each serves its own model.
+    let routed = router.complete(short("Say hi.")).expect("router completion");
+    let thought = thinker
+        .complete(short("Say hi."))
+        .expect("thinker completion");
+    assert!(!routed.text.is_empty(), "router generated nothing");
+    assert!(!thought.text.is_empty(), "thinker generated nothing");
+
+    // The router still works after the thinker has been used: the two engines
+    // hold separate contexts and neither disturbs the other's slots.
+    let again = router.complete(short("Say hi.")).expect("router again");
+    assert!(!again.text.is_empty());
+}
+
+#[serial]
+#[test]
+fn per_engine_config_is_clamped_not_trusted() {
+    // `InferenceConfig`'s fields are public, so a caller can hand over
+    // `n_slots: 0`, which would divide by zero when the per-slot budget is
+    // computed. The engine must clamp rather than panic.
+    let client = Client::with_config(
+        model_230m(),
+        InferenceConfig {
+            n_slots: 0,
+            n_ctx: 0,
+            n_threads: 0,
+            n_threads_batch: 0,
+            kv_cache: true,
+        },
+    )
+    .expect("client with a degenerate config");
+    // n_ctx clamps up to n_slots (1), leaving a 1-token budget — too small for
+    // any prompt, so this must be a clean error rather than a crash.
+    let err = client.complete(short("Hi")).expect_err("budget is 1 token");
+    assert!(matches!(err, LlamaError::Inference(_)), "got {err:?}");
 }
 
 #[serial]

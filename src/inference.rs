@@ -1173,7 +1173,53 @@ impl Engine {
     ///
     /// [`LlamaError::Io`] if either thread cannot be spawned.
     pub fn start(model_path: impl AsRef<Path>) -> Result<Self> {
-        let config = InferenceConfig::from_env();
+        Self::start_with_config(model_path, InferenceConfig::from_env())
+    }
+
+    /// Load `model_path` with an explicit configuration, ignoring the
+    /// `LLAMAD_*` environment variables.
+    ///
+    /// Use this when one process runs **more than one model** and they need
+    /// different budgets — a small router model and a large reasoning model
+    /// want different context sizes and thread counts, and the environment is
+    /// process-global, so [`start`](Self::start) would give both the same
+    /// settings.
+    ///
+    /// Values are clamped into usable ranges, so a hand-built config with a
+    /// zero or absurd field degrades rather than panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`LlamaError::Io`] if either thread cannot be spawned.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use llamad::{config::InferenceConfig, inference::Engine};
+    /// # fn example() -> Result<(), llamad::protocol::LlamaError> {
+    /// // Two engines, sized independently, sharing one machine's cores.
+    /// let router = Engine::start_with_config("small.gguf", InferenceConfig {
+    ///     n_ctx: 1024,
+    ///     n_threads: 2,
+    ///     ..Default::default()
+    /// })?;
+    /// let thinker = Engine::start_with_config("big.gguf", InferenceConfig {
+    ///     n_ctx: 8192,
+    ///     n_threads: 4,
+    ///     ..Default::default()
+    /// })?;
+    /// # let _ = (router, thinker);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start_with_config(
+        model_path: impl AsRef<Path>,
+        config: InferenceConfig,
+    ) -> Result<Self> {
+        // Clamped here rather than trusting the caller: the fields are public,
+        // so a hand-built config can carry `n_slots: 0`, which would divide by
+        // zero in `per_slot_budget`.
+        let config = config.sane();
 
         // client → preprocess (raw requests), preprocess → inference (prepared),
         // inference → preprocess (Arc<LlamaModel> once loaded).

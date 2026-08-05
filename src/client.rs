@@ -4,6 +4,7 @@ use std::path::Path;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::config::InferenceConfig;
 use crate::inference::Engine;
 use crate::protocol::{InferCmd, InferResult, LlamaError, Request};
 
@@ -82,6 +83,49 @@ impl Client {
     pub fn new(model_path: impl AsRef<Path>) -> Result<Self, LlamaError> {
         Ok(Client {
             engine: Engine::start(model_path)?,
+        })
+    }
+
+    /// Load a model with an explicit configuration, ignoring the `LLAMAD_*`
+    /// environment variables.
+    ///
+    /// Use this when one process runs **more than one model**. Environment
+    /// configuration is process-global, so [`new`](Self::new) gives every
+    /// client the same context size and thread budget — rarely what you want
+    /// when a small routing model and a large reasoning model share a machine.
+    ///
+    /// Values are clamped into usable ranges, so a hand-built config with a
+    /// zero or absurd field degrades rather than panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`LlamaError::Io`] if the inference threads cannot be spawned.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use llamad::{client::Client, config::InferenceConfig};
+    /// # fn example() -> Result<(), llamad::protocol::LlamaError> {
+    /// let router = Client::with_config("small.gguf", InferenceConfig {
+    ///     n_ctx: 1024,
+    ///     n_threads: 2,
+    ///     ..Default::default()
+    /// })?;
+    /// let thinker = Client::with_config("big.gguf", InferenceConfig {
+    ///     n_ctx: 8192,
+    ///     n_threads: 4,
+    ///     ..Default::default()
+    /// })?;
+    /// # let _ = (router, thinker);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_config(
+        model_path: impl AsRef<Path>,
+        config: InferenceConfig,
+    ) -> Result<Self, LlamaError> {
+        Ok(Client {
+            engine: Engine::start_with_config(model_path, config)?,
         })
     }
 
