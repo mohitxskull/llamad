@@ -750,11 +750,22 @@ The order matters: publishing is irreversible, so it runs after every cheap
 check and before the release announcement. A failed publish leaves no GitHub
 Release claiming a version that does not exist.
 
-**Trusted Publishing needs a one-time setup** at
-`https://crates.io/crates/llamad/settings` — register repository owner
-`mohitxskull`, repository name `llamad`, and workflow filename `release.yml`.
-Until that exists, the publish job fails to authenticate (the crate is not
-published, and the tag can be deleted and re-pushed).
+**First release only.** A trusted publisher is configured per crate at
+`https://crates.io/crates/llamad/settings`, and that page does not exist until
+the crate has been published once. So the first release authenticates with a
+token instead:
+
+1. Create a scoped publish token at `https://crates.io/settings/tokens`.
+2. Add it as the `CARGO_REGISTRY_TOKEN` repository secret.
+3. Push the tag as above.
+4. Afterwards, register the trusted publisher (repository owner `mohitxskull`,
+   repository name `llamad`, workflow filename `release.yml`) and **delete the
+   secret** — the publish job uses the secret when it is set and OIDC when it
+   is not, so removing it switches every later release to Trusted Publishing
+   with no stored credential.
+
+If authentication fails the crate is simply not published; delete the tag,
+fix the setup, and re-tag.
 
 A version can be yanked but never replaced or reused, which is why the tag —
 not a branch push or a commit subject — is what triggers this.
