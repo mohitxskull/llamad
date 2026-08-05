@@ -72,6 +72,13 @@ name = "llamad"
 path = "src/main.rs"
 required-features = ["bin"]
 
+# Dependencies (especially llama.cpp/ggml) build in dev mode with full
+# debuginfo, which balloons target/debug. Optimizing deps keeps the daemon
+# fast to run and slashes target-dir size without affecting our own
+# debuggability.
+[profile.dev.package."*"]
+opt-level = 2
+
 [lints.clippy]
 # `warn`, not `deny`: a future clippy release that adds a lint must not break
 # downstream builds. CI runs `cargo clippy -- -D warnings` to keep this clean.
