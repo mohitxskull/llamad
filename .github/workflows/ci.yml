@@ -97,6 +97,42 @@ jobs:
       - name: Real-model tests
         run: cargo test --test integration --test lifecycle --test reuse --test cancellation
 
+  # Proves the platform claims in the README instead of assuming them. The
+  # library must build and its unit tests pass everywhere; the daemon is Unix
+  # only, so on Windows `--bins` builds the stub `main` that exits with an
+  # explanation rather than a link error.
+  #
+  # `fail-fast: false` so a macOS failure still reports the Windows result and
+  # vice versa — when a platform breaks, knowing whether the other one also
+  # broke is most of the diagnosis.
+  cross-platform:
+    name: cross-platform (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No acceleration feature: Metal on macOS is opt-in, and a stock build is
+      # what a downstream consumer gets by default on either platform.
+      - name: Build library and binary
+        run: cargo build --lib --bins
+
+      # On Windows the `server` module is cfg'd out, so its tests vanish with
+      # it and the count is lower than on Unix. That is expected, not a gap.
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Doc tests
+        run: cargo test --doc
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -64,4 +64,12 @@ pub mod config;
 pub mod inference;
 mod preprocess;
 pub mod protocol;
+/// The Unix-socket daemon protocol.
+///
+/// **Unix only.** This module is compiled on Linux and macOS and absent on
+/// Windows, which has no `tokio::net::UnixListener`. The rest of the crate —
+/// [`Client`](client::Client), [`Engine`](inference::Engine) and everything
+/// they need — is portable; only the socket server and the `llamad` binary
+/// depend on the platform.
+#[cfg(unix)]
 pub mod server;

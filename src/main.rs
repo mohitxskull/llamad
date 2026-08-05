@@ -1,8 +1,15 @@
 //! The `llamad` daemon: serves the JSON/NDJSON protocol over a Unix socket.
+//!
+//! **Unix only.** Cargo cannot gate a `[[bin]]` target by platform, so this
+//! file still compiles on Windows — it just exits with an explanation. The
+//! library is portable; only the daemon needs a Unix socket.
 
+#[cfg(unix)]
 use llamad::inference::Engine;
+#[cfg(unix)]
 use llamad::server::{DEFAULT_SOCKET_PATH, bind_socket, handle_connection};
 
+#[cfg(unix)]
 fn usage(program: &str) {
     eprintln!("Usage: {program} <model.gguf> [socket-path]");
     eprintln!();
@@ -19,6 +26,23 @@ fn usage(program: &str) {
     eprintln!("  RUST_LOG                  Log filter (default: warn)");
 }
 
+/// On Windows there is no `tokio::net::UnixListener`, so the daemon cannot be
+/// built. Exiting with a clear message beats a link error, and beats silently
+/// shipping a binary that appears to work.
+///
+/// The library still works on Windows — use [`llamad::client::Client`]
+/// in-process instead. Serving over Windows named pipes would be a real
+/// feature, not a port of this file; open an issue if you need it.
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "the llamad daemon requires Unix domain sockets and is not available on this platform.\n\
+         Use the library in-process instead: llamad::client::Client::new(\"model.gguf\")"
+    );
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
