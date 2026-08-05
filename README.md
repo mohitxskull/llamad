@@ -160,12 +160,47 @@ Two things to get right:
   230M router does not need the 1.2B model's context, and paying for it wastes
   memory on every slot.
 
-- **Budget threads across models, not per model.** Each engine defaults to
-  `num_cpus::get_physical()` threads. Two engines both defaulting on a 4-core
-  machine means 8 ggml worker threads fighting over 4 cores, and ggml's workers
-  spin — the result is slower than either model alone. Split the cores
-  explicitly, as above. Threads are allocated per engine for the life of the
-  engine, not per request, so this is a decision you make once at construction.
+- **Decide thread counts from how often the models run at the same time.**
+  Each engine defaults to `num_cpus::get_physical()` threads, so several
+  engines each claim every core. That costs concurrency *scaling* but is not a
+  collapse — see the measurements below. It is a decision made once per engine
+  at construction, not per request.
+
+There is no hard limit on how many models you load; three or four behave like
+two. What actually bounds it is RAM and cores.
+
+**Cost of keeping models resident.** Three models (135M + 230M + 1.2B, all
+Q4_K_M) measured on the 4-core i5-1135G7:
+
+| | measured |
+|---|---|
+| Resident memory | 1066 MB — roughly the sum of the GGUF files plus KV cache |
+| OS threads | 2 per engine (preprocess + inference), 7 total including main |
+| CPU while idle | **0%** over 5 s with all three loaded |
+
+Idle engines are free: the inference thread blocks on its command channel when
+no slot is active, so an unused model costs memory and nothing else. Keeping a
+rarely-used model loaded is cheap.
+
+**Cost of running two at once.** Two models generating 60 tokens each, three
+runs, same box:
+
+| Threads per engine | Each alone (sum) | Both concurrently | Speedup |
+|---|---|---|---|
+| 2 + 2 (cores split) | ~6.7 s | ~5.2 s | 1.27–1.28× |
+| 4 + 4 (both claim all cores) | ~4.0 s | ~3.6–4.0 s | 1.00–1.12× |
+
+Oversubscription is visible — it erodes the concurrency gain toward 1.0×, i.e.
+the two models end up serializing on the cores — but it did **not** make things
+slower than running them sequentially, and the higher per-model thread count
+made every individual request faster. Splitting cores gives better parallel
+scaling; not splitting gives better latency whenever only one model is active.
+
+So: if your models mostly take turns (a router deciding, then a thinker
+answering), give each all cores. If they genuinely generate simultaneously and
+sustained, split the cores. Measure on your own hardware before assuming —
+these numbers are one CPU, two small models, and do not extrapolate to a
+16-core box.
 
 Models stay resident for as long as their client is alive. There is no registry,
 no lazy loading and no eviction: dropping a client unloads its model and joins

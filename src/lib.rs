@@ -29,9 +29,12 @@
 //! [`Client::with_config`](client::Client::with_config) and give each its own
 //! context and thread budget — the `LLAMAD_*` variables are process-global, so
 //! [`Client::new`](client::Client::new) would give both the same settings.
-//! Split the machine's cores between them explicitly: every engine otherwise
-//! defaults to all physical cores, and two engines doing that oversubscribe
-//! ggml's spinning worker threads.
+//! There is no limit on how many engines are alive; RAM and cores bound it.
+//! An idle engine costs memory but no CPU — its inference thread blocks on the
+//! command channel whenever no slot is active. Thread counts are worth
+//! choosing deliberately: every engine otherwise claims all physical cores,
+//! which is fine when the models take turns and costs parallel scaling when
+//! they generate simultaneously. See the README for measurements.
 //!
 //! # Blocking and async
 //!

@@ -115,9 +115,9 @@ First public release. Everything below is new.
   `LLAMAD_N_THREADS_BATCH`, `LLAMAD_KV_CACHE`, all range-clamped so a bad
   value degrades instead of panicking.
 - Thread counts default to physical cores rather than logical, avoiding
-  hyperthread collapse. A process running several engines should divide the
-  cores between them explicitly — each engine otherwise claims all of them,
-  and ggml's workers spin.
+  hyperthread collapse. Several engines in one process each claim every core
+  by default; measurements for splitting versus not are in the README, along
+  with the memory and idle-CPU cost of keeping several models resident.
 - `n_ctx` is floored at 2 as well as at `n_slots`. `n_batch` is set to `n_ctx`
   and llama.cpp hard-asserts `n_tokens_all <= n_batch`, so a smaller context
   aborted the process on the startup KV-rewind probe — reachable from
