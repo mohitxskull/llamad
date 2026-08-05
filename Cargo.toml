@@ -1,10 +1,10 @@
 [package]
 name = "llamad"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "General-purpose GGUF model daemon: slotted KV-cache batching, prefix reuse, streaming, Unix-socket server"
+description = "CPU-first in-process GGUF inference: slotted KV-cache batching, prefix reuse, grammars, streaming, and a local-IPC daemon"
 repository = "https://github.com/mohitxskull/llamad"
 readme = "README.md"
 keywords = ["llama", "gguf", "llm", "inference", "daemon"]

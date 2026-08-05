@@ -8,6 +8,62 @@ Entries below the first release heading are generated from
 [Conventional Commits](https://www.conventionalcommits.org/) by
 [git-cliff](https://git-cliff.org) — see "Releasing" in the README.
 
+## [0.2.0] - 2026-08-06
+
+### Added
+
+- **Windows support.** The daemon now serves the same JSON/NDJSON protocol over
+  a named pipe (`\\.\pipe\llamad`) that it serves over a Unix socket on Linux
+  and macOS. `bind_pipe` creates the server instance; the accept loop creates
+  its successor before handing off a connection, because a named-pipe server
+  handle *becomes* the connection once a client attaches — without that,
+  nothing is listening between connections.
+- CI builds and tests on `macos-latest` and `windows-latest`. Every job
+  previously ran on Ubuntu, so portability was an assumption rather than a
+  fact.
+- `.githooks/pre-commit` runs the same checks as CI's `check` job — rustfmt,
+  clippy and rustdoc at `-D warnings`, unit and doc tests, and a compile of the
+  real-model test binaries. Enable with
+  `git config core.hooksPath .githooks`.
+- `examples/multi_model.rs`: a small router plus a large thinker in one
+  process, with per-model config, grammar-constrained routing and lazy loading.
+
+### Changed
+
+- **A request may now end at a newline as well as at EOF.** Windows named pipes
+  have no half-close — closing the handle closes both directions — so a frame
+  that ended only at EOF would deadlock the daemon, which would wait forever
+  for a request it already held in full. `serde_json` escapes newlines inside
+  strings and never emits a raw one, so a newline is an unambiguous boundary.
+  Clients that half-close are unaffected.
+- `handle_connection` is generic over `AsyncRead + AsyncWrite + Unpin` rather
+  than taking a `UnixStream`, so one copy of the protocol serves both
+  transports. Callers passing a `UnixStream` still compile unchanged;
+  `bind_socket` and `DEFAULT_SOCKET_PATH` are now platform-conditional.
+- Named-pipe access control is documented rather than assumed equivalent to the
+  Unix path. `reject_remote_clients` is set, so the pipe is unreachable over
+  SMB — which a named pipe otherwise permits by default and a Unix socket never
+  does. Local access falls back to the default pipe DACL (creating user,
+  `SYSTEM`, `Administrators`), comparable to `0600` but not identical: a
+  machine administrator can open it.
+- The MSRV job checks `--lib --bins` instead of `--all-targets`. The MSRV is a
+  promise about what a consumer can build, and a consumer never builds our
+  dev-dependencies; `serial_test` requires rustc 1.93 and would have forced the
+  declared MSRV up to satisfy a crate that is never shipped.
+- GitHub Actions moved off the deprecated Node 20 runtime: `checkout` v4 → v7,
+  `action-gh-release` v2 → v3, `cache` v4 → v6.
+
+### Fixed
+
+- **The crate did not compile on Windows at all.** `pub mod server;` was
+  ungated while `server.rs` uses `std::os::unix::fs` and
+  `tokio::net::UnixListener`, so `cargo add llamad` failed there — the library,
+  not just the daemon — with nothing in the README or the crate metadata
+  warning anyone.
+- An intra-doc link to a `cfg`-gated item broke `cargo doc` on every platform
+  that does not define it. rustfmt, clippy and the full test suite all pass
+  through this class of error, which is why the pre-commit hook runs rustdoc.
+
 ## [0.1.0] - 2026-08-05
 
 First public release. Everything below is new.

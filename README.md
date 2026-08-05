@@ -676,7 +676,7 @@ cargo test --test reuse               # KV-prefix-reuse path tests (attention mo
 cargo test --test cancellation        # slot-recycling cancellation test
 ```
 
-142 unit tests + 32 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 6 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
+143 unit tests + 32 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 6 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
 
 ### KV-reuse path (`LLAMAD_TEST_MODEL` / bundled SmolLM2)
 
@@ -690,7 +690,7 @@ The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages o
 | Preprocess | 29 | Chat templating (`build_messages`), sampling resolution and clamping, grammar validation, stop-sequence normalization, budget checks, defaults |
 | Slot lifecycle + KV reuse | 51 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
 | Client API | 15 | complete/complete_stream, async variants, error propagation, done-signal ordering, `Send + Sync` guard |
-| Server | 15 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, size cap, error responses |
+| Server | 16 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, newline-framed request with no half-close (the mechanism Windows needs), size cap, error responses. A `cfg(windows)` module mirrors the protocol assertions over a named pipe; those run on the `windows-latest` CI job, not locally. |
 | Config | 15 | Env parsing, defaults, `sane()` clamping, true-spelling flip-from-disabled |
 | Integration | 21 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility, grammar constraint (sampled + greedy + JSON) and rejection of malformed/null-byte/unknown-root grammars without killing the engine |
 | Lifecycle | 7 | Real model: two models side by side with independent configs, degenerate-config clamping, two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
@@ -806,22 +806,19 @@ The order matters: publishing is irreversible, so it runs after every cheap
 check and before the release announcement. A failed publish leaves no GitHub
 Release claiming a version that does not exist.
 
-**First release only.** A trusted publisher is configured per crate at
-`https://crates.io/crates/llamad/settings`, and that page does not exist until
-the crate has been published once. So the first release authenticates with a
-token instead:
+Authentication is [Trusted
+Publishing](https://crates.io/docs/trusted-publishing): the publish job mints a
+short-lived token over OIDC, so there is no registry credential stored in this
+repository. Nothing to rotate, and nothing to leak.
 
-1. Create a scoped publish token at `https://crates.io/settings/tokens`.
-2. Add it as the `CARGO_REGISTRY_TOKEN` repository secret.
-3. Push the tag as above.
-4. Afterwards, register the trusted publisher (repository owner `mohitxskull`,
-   repository name `llamad`, workflow filename `release.yml`) and **delete the
-   secret** — the publish job uses the secret when it is set and OIDC when it
-   is not, so removing it switches every later release to Trusted Publishing
-   with no stored credential.
+The workflow also accepts a `CARGO_REGISTRY_TOKEN` secret and prefers it when
+present. That path exists because a trusted publisher is configured per crate
+at `https://crates.io/crates/<name>/settings`, a page that does not exist until
+the crate has been published once — so a brand-new crate cannot use OIDC for
+its first release. It is unused here and should stay that way.
 
-If authentication fails the crate is simply not published; delete the tag,
-fix the setup, and re-tag.
+If authentication fails the crate is simply not published; delete the tag, fix
+the setup, and re-tag.
 
 A version can be yanked but never replaced or reused, which is why the tag —
 not a branch push or a commit subject — is what triggers this.
