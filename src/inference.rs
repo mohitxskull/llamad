@@ -2231,6 +2231,34 @@ mod tests {
     // character.
 
     use proptest::prelude::*;
+    use proptest::test_runner::{FailurePersistence, FileFailurePersistence};
+
+    /// Where a failing case's seed is written.
+    ///
+    /// Proptest's default is `SourceParallel("proptest-regressions")`, which
+    /// resolves to a sibling of `src/` — a directory in the repository root.
+    /// Pointed under `tests/` instead so the regression corpus sits with the
+    /// rest of the test material rather than at the top level.
+    ///
+    /// `SourceParallel`, not `Direct`: the file is still named after the source
+    /// it came from, so property tests added to another module get their own
+    /// file instead of appending to this one.
+    ///
+    /// The argument is resolved against the *sibling* of the directory holding
+    /// `lib.rs` — the crate root — so it is written without a leading `../`.
+    /// A `../` here silently escapes the repository: proptest reports no error,
+    /// the tests still pass, and the seeds land in the parent directory.
+    ///
+    /// These seeds are committed on purpose. They are the inputs that killed
+    /// mutants of `floor_char_boundary` and the UTF-8 buffer — a two-byte "é"
+    /// sliced at offset 1, a four-byte 𐀀, and a string mixing NUL, vertical
+    /// tab and U+0080 — so keeping them turns a lucky random draw into a
+    /// deterministic case that runs before any new ones.
+    fn regression_file() -> Option<Box<dyn FailurePersistence>> {
+        Some(Box::new(FileFailurePersistence::SourceParallel(
+            "tests/proptest-regressions",
+        )))
+    }
 
     /// Split `bytes` at the given offsets, each taken modulo the remaining
     /// length so any generated vector produces a valid chunking.
@@ -2251,6 +2279,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig {
+            failure_persistence: regression_file(),
+            ..ProptestConfig::default()
+        })]
         /// Reassembly is lossless however the tokenizer splits the bytes.
         ///
         /// This is the contract `push_raw_bytes` exists for: a multi-byte
