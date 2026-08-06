@@ -22,13 +22,22 @@
 //! A newline terminator fixes that without breaking anything, because
 //! `serde_json` escapes newlines inside strings and never emits a raw one. A
 //! client that half-closes still works: EOF ends the frame too.
+//!
+//! Replies are framed the same way, for the same reason: every line the daemon
+//! writes — the non-streaming response, each streamed token, and every error —
+//! ends with a newline. A client can therefore parse a reply as soon as it
+//! arrives instead of reading to EOF, which on a named pipe means waiting for
+//! the server to drop the connection. Trailing whitespace is insignificant to
+//! JSON, so a client that does read to EOF is unaffected.
 
 use std::sync::mpsc;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 
-use crate::protocol::{InferCmd, LlamaError, Request, Response, TokenChunk};
+use crate::protocol::{
+    ErrorResponse, InferCmd, LlamaError, Request, Response, StreamDone, TokenChunk,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -164,6 +173,29 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Opt
     Ok(Some(buf))
 }
 
+/// Write one newline-terminated reply line.
+///
+/// Every reply the daemon writes — success, error, and each streamed token —
+/// ends with a newline, mirroring the request framing. The terminator is what
+/// lets a client parse a reply without waiting for the connection to close,
+/// which matters most on Windows named pipes: they have no half-close, so
+/// "read until EOF" is the one framing rule that transport cannot express
+/// cheaply. Returns `false` once the client has hung up.
+async fn write_line<S: AsyncWrite + Unpin>(stream: &mut S, line: &str) -> bool {
+    stream.write_all(line.as_bytes()).await.is_ok() && stream.write_all(b"\n").await.is_ok()
+}
+
+/// Write an `{"error": ...}` reply. Failures are ignored: the connection is
+/// being abandoned either way, and there is nobody left to report to.
+async fn reply_error<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) {
+    let err = ErrorResponse {
+        error: message.to_owned(),
+    };
+    if let Ok(json) = serde_json::to_string(&err) {
+        let _ = write_line(stream, &json).await;
+    }
+}
+
 /// Read one request from `stream`, run it, and write the reply.
 ///
 /// Generic over the stream so the same protocol serves a Unix socket and a
@@ -188,31 +220,29 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             })
             .await;
 
-            let err = serde_json::json!({
-                "error": format!("request too large (max {MAX_REQUEST_BYTES} bytes)")
-            });
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(
+                stream,
+                &format!("request too large (max {MAX_REQUEST_BYTES} bytes)"),
+            )
+            .await;
             return;
         }
         Ok(Err(_)) => return, // connection died mid-request; nobody to tell
         Err(_) => {
-            let err = serde_json::json!({"error": "read timeout"});
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(stream, "read timeout").await;
             return;
         }
     };
 
     if buf.is_empty() {
-        let err = serde_json::json!({"error": "empty request"});
-        let _ = stream.write_all(err.to_string().as_bytes()).await;
+        reply_error(stream, "empty request").await;
         return;
     }
 
     let req: Request = match serde_json::from_slice(&buf) {
         Ok(r) => r,
         Err(e) => {
-            let err = serde_json::json!({"error": format!("invalid request: {e}")});
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(stream, &format!("invalid request: {e}")).await;
             return;
         }
     };
@@ -242,27 +272,22 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
         })
         .is_err()
     {
-        let err = serde_json::json!({"error": "inference thread unavailable"});
-        let _ = stream.write_all(err.to_string().as_bytes()).await;
+        reply_error(stream, "inference thread unavailable").await;
         return;
     }
 
     loop {
         match tokio::time::timeout(STREAM_TIMEOUT, token_rx.recv()).await {
             Ok(Some(token)) => {
-                if let Ok(json) = serde_json::to_string(&TokenChunk { token: &token }) {
-                    if stream.write_all(json.as_bytes()).await.is_err() {
-                        return;
-                    }
-                    if stream.write_all(b"\n").await.is_err() {
-                        return;
-                    }
+                if let Ok(json) = serde_json::to_string(&TokenChunk { token: &token })
+                    && !write_line(stream, &json).await
+                {
+                    return; // client hung up mid-stream
                 }
             }
             Ok(None) => break,
             Err(_) => {
-                let err = serde_json::json!({"error": "stream timeout"});
-                let _ = stream.write_all(err.to_string().as_bytes()).await;
+                reply_error(stream, "stream timeout").await;
                 return;
             }
         }
@@ -270,22 +295,16 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
 
     match done_rx.await {
         Ok(Ok(result)) => {
-            let done = serde_json::json!({
-                "text": result.text,
-                "prompt_tokens": result.prompt_tokens,
-                "generated_tokens": result.generated_tokens,
-                "done": true,
-            });
-            let _ = stream.write_all(done.to_string().as_bytes()).await;
-            let _ = stream.write_all(b"\n").await;
+            let done = StreamDone::from(Response::from(result));
+            if let Ok(json) = serde_json::to_string(&done) {
+                let _ = write_line(stream, &json).await;
+            }
         }
         Ok(Err(e)) => {
-            let err = serde_json::json!({"error": format!("inference: {e}")});
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(stream, &format!("inference: {e}")).await;
         }
         Err(_) => {
-            let err = serde_json::json!({"error": "inference stream ended unexpectedly"});
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(stream, "inference stream ended unexpectedly").await;
         }
     }
 }
@@ -304,29 +323,21 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
         })
         .is_err()
     {
-        let err = serde_json::json!({"error": "inference thread unavailable"});
-        let _ = stream.write_all(err.to_string().as_bytes()).await;
+        reply_error(stream, "inference thread unavailable").await;
         return;
     }
 
     match resp_rx.await {
         Ok(Ok(result)) => {
-            let resp = Response {
-                text: result.text,
-                prompt_tokens: result.prompt_tokens,
-                generated_tokens: result.generated_tokens,
-            };
-            if let Ok(json) = serde_json::to_string(&resp) {
-                let _ = stream.write_all(json.as_bytes()).await;
+            if let Ok(json) = serde_json::to_string(&Response::from(result)) {
+                let _ = write_line(stream, &json).await;
             }
         }
         Ok(Err(e)) => {
-            let err = serde_json::json!({"error": format!("inference: {e}")});
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(stream, &format!("inference: {e}")).await;
         }
         Err(_) => {
-            let err = serde_json::json!({"error": "inference thread crashed"});
-            let _ = stream.write_all(err.to_string().as_bytes()).await;
+            reply_error(stream, "inference thread crashed").await;
         }
     }
 }

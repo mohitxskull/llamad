@@ -206,6 +206,40 @@ pub struct TokenChunk<'a> {
     pub token: &'a str,
 }
 
+/// The final NDJSON line of a streaming socket response: the same fields as
+/// [`Response`], plus `done: true` to distinguish it from a [`TokenChunk`].
+///
+/// A type rather than an inline JSON literal so the terminator cannot drift
+/// from [`Response`] — a field added there appears here automatically instead
+/// of being silently omitted from the streaming path.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StreamDone {
+    /// The completion and its token accounting.
+    #[serde(flatten)]
+    pub response: Response,
+    /// Always `true`. Present so a client can tell the terminator from a
+    /// token line without inspecting which keys exist.
+    pub done: bool,
+}
+
+impl From<Response> for StreamDone {
+    fn from(response: Response) -> Self {
+        StreamDone {
+            response,
+            done: true,
+        }
+    }
+}
+
+/// The body the daemon writes for any failure, in both streaming and
+/// non-streaming mode.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ErrorResponse {
+    /// Human-readable description. Not a stable machine-readable code — in
+    /// process, match on [`LlamaError`] instead.
+    pub error: String,
+}
+
 /// A finished completion with its token accounting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferResult {
@@ -215,6 +249,20 @@ pub struct InferResult {
     pub prompt_tokens: usize,
     /// Tokens generated, excluding the end-of-generation token.
     pub generated_tokens: usize,
+}
+
+/// The wire response carries exactly the internal result's fields. Converting
+/// here rather than splicing them field-by-field at the call site keeps the
+/// mapping in one place: a field added to [`InferResult`] that belongs on the
+/// wire is added once, and one that does not is an explicit omission here.
+impl From<InferResult> for Response {
+    fn from(r: InferResult) -> Self {
+        Response {
+            text: r.text,
+            prompt_tokens: r.prompt_tokens,
+            generated_tokens: r.generated_tokens,
+        }
+    }
 }
 
 impl Request {
@@ -568,6 +616,55 @@ mod tests {
     fn test_token_chunk_deserializes() {
         let chunk: TokenChunk = serde_json::from_str(r#"{"token":"ab"}"#).unwrap();
         assert_eq!(chunk.token, "ab");
+    }
+
+    #[test]
+    fn test_stream_done_is_a_flat_response_plus_the_done_flag() {
+        // The wire shape is load-bearing: the terminator must be a *flat*
+        // object, not `{"response":{...},"done":true}`. A dropped
+        // `#[serde(flatten)]` would nest it and break every streaming client.
+        let done = StreamDone::from(Response {
+            text: "hi".into(),
+            prompt_tokens: 3,
+            generated_tokens: 1,
+        });
+        let json = serde_json::to_string(&done).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v["prompt_tokens"], 3);
+        assert_eq!(v["generated_tokens"], 1);
+        assert_eq!(v["done"], true);
+        assert!(v.get("response").is_none(), "must not nest: {json}");
+        assert_eq!(serde_json::from_str::<StreamDone>(&json).unwrap(), done);
+    }
+
+    #[test]
+    fn test_infer_result_converts_to_the_wire_response() {
+        // The conversion exists so the wire type cannot drift from the
+        // internal one; this pins that every field carries across.
+        let result = InferResult {
+            text: "out".into(),
+            prompt_tokens: 9,
+            generated_tokens: 4,
+        };
+        assert_eq!(
+            Response::from(result),
+            Response {
+                text: "out".into(),
+                prompt_tokens: 9,
+                generated_tokens: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_error_response_round_trips() {
+        let err = ErrorResponse {
+            error: "boom".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(json, r#"{"error":"boom"}"#);
+        assert_eq!(serde_json::from_str::<ErrorResponse>(&json).unwrap(), err);
     }
 
     #[test]

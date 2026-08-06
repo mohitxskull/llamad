@@ -391,10 +391,19 @@ would deadlock: the daemon would wait forever for bytes it already had.
 newline is an unambiguous frame boundary. Clients that half-close still work
 unchanged.
 
+Replies are framed the same way: every line the daemon writes — the
+non-streaming response, each streamed token, and every error — ends with a
+newline. A client can therefore stop at the terminator instead of reading to
+EOF, which on a named pipe means waiting for the daemon to drop the
+connection. Trailing whitespace is insignificant to JSON, so a client that
+does read to EOF is unaffected.
+
 Fields: `prompt` (required), `system`, `max_tokens`, `temperature`, `top_k`, `top_p`, `repeat_penalty`, `repeat_last_n`, `seed`, `stop` (`[string]`), `stream` (bool), `history` (`[{role, content}]`). See [Generation parameters](#generation-parameters) for defaults and ranges. Unknown fields rejected. Request bodies are capped at 1 MiB (`server::MAX_REQUEST_BYTES`).
 
-`Request` and `Response` both implement `Serialize` and `Deserialize`, so a
-Rust consumer of the socket protocol can use the crate's own types rather than
+Every wire shape has a type in `protocol` — `Request`, `Response`,
+`TokenChunk` (one streamed token), `StreamDone` (the streaming terminator) and
+`ErrorResponse` — and all implement `Serialize` and `Deserialize`, so a Rust
+consumer of the socket protocol can use the crate's own types rather than
 hand-rolling the JSON. `None` fields are skipped on serialization, so a
 round-trip reproduces the original request.
 
