@@ -8,6 +8,46 @@ Entries below the first release heading are generated from
 [Conventional Commits](https://www.conventionalcommits.org/) by
 [git-cliff](https://git-cliff.org) — see "Releasing" in the README.
 
+## [0.3.0] — 2026-08-06
+
+### Added
+
+- **protocol**: Split Busy/PromptTooLong/Disconnected out of LlamaError::Inference **(breaking)**
+- **server**: Give every reply a type and a newline terminator
+- Enforce the unsafe and no-panic guidelines with lints
+
+### Build
+
+- Drop cargo-mutants; record what it found and why it is not kept
+
+### Changed
+
+- **bin**: Separate the missing-argument and --help exit paths
+- **inference**: Extract Scheduler phases and a single abandon_slot
+- **preprocess**: Funnel hand-off failures through forward()
+- **client**: Drop the unreachable no-stats TokenStream path
+
+### Documentation
+
+- Bring the README back in line with the test suite
+
+### Fixed
+
+- **config**: Make the upper-bound clamp test 32-bit safe
+- **bench**: Exclude the TTFT token from decode throughput
+
+### Testing
+
+- **server**: Share one harness and mock across both transports
+- **config**: Fix a guard test that could not catch its own defect
+- **inference**: Add property tests for UTF-8 and stop-sequence handling
+- Name model fixtures by capability and guard against drift
+- **bin**: Cover the daemon binary end to end
+- **config**: Make the thread-count default testable off a 4-core host
+- **inference**: Keep proptest regressions under tests/
+- **client**: Cover complete_text_async
+- **protocol**: Assert every Request builder sets its field
+
 ## [0.2.0] - 2026-08-06
 
 ### Added
