@@ -157,3 +157,29 @@ jobs:
       # actually depend on — do build on 1.88.
       - name: Check against the declared MSRV
         run: cargo check --lib --bins
+
+  # Supply-chain check against the RustSec advisory database.
+  #
+  # Scope worth knowing: `cargo audit` covers the *Rust* dependency graph from
+  # Cargo.lock. It says nothing about the vendored llama.cpp/ggml C++ that
+  # llama-cpp-sys-4 compiles, which is the bulk of the code this crate
+  # executes. Useful, not sufficient.
+  #
+  # Not in the pre-commit hook: it needs the network and a `cargo install`,
+  # and a hook slow enough to be annoying is a hook people bypass.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--locked` so the audit tool itself builds reproducibly.
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit

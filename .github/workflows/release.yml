@@ -83,6 +83,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Compare the public API against the last version on crates.io and
+      # refuse the release if the version bump does not cover what changed.
+      #
+      # Here rather than in ci.yml on purpose: semver-checks judges the API
+      # against the version in Cargo.toml, and on main that version is still
+      # the *released* one while breaking changes accumulate — so running it
+      # per-push would sit red for the whole development cycle and teach
+      # everyone to ignore it. At tag time the bump has happened, which is
+      # exactly when the question "is this bump big enough?" has an answer.
+      #
+      # Cargo's 0.x rule applies: for 0.y.z a minor bump may break the API, a
+      # patch bump may not. So 0.2.0 -> 0.3.0 with breaking changes passes,
+      # and 0.2.0 -> 0.2.1 with the same changes fails.
+      - name: Install cargo-semver-checks
+        run: cargo install --locked cargo-semver-checks
+
+      - name: Public API matches the version bump
+        run: cargo semver-checks check-release
+
       # Compiles the packaged tarball, which is what crates.io will build.
       # Catches an `exclude` that dropped a file the crate needs.
       - name: Package
