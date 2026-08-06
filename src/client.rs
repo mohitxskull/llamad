@@ -405,6 +405,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_complete_text_async_returns_the_generated_text() {
+        // Found by mutation testing: replacing this method's body with
+        // `Ok(String::new())` survived the whole suite. `complete_text` and
+        // `complete_async` were both covered, so the gap was invisible by
+        // inspection — it is exactly the combination neither test reached.
+        let client = mock_client();
+        let text = client.complete_text_async("hello").await.unwrap();
+        assert_eq!(text, "echo: hello");
+    }
+
+    #[tokio::test]
     async fn test_into_result_async_returns_stats() {
         let client = mock_client();
         let result = client
