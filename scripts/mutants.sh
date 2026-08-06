@@ -73,6 +73,21 @@ case " $* " in
     *) set -- --in-place "$@" ;;
 esac
 
+# ── Kill a runaway before it matters ─────────────────────────────────────────
+#
+# The real defence against the `next_token -> Some(...)` memory bomb described
+# below. cargo-mutants derives its timeout from the baseline, which lands
+# around 30s — but the bomb allocates ~1.7 GB every 3 seconds, so it exhausts
+# a 14 GB machine before that fires.
+#
+# The unit suite runs in 0.02s. Ten seconds is three orders of magnitude of
+# headroom for a legitimate test and stops a runaway at roughly 5 GB, well
+# inside the cgroup cap that backstops it.
+case " $* " in
+    *" --timeout "*|*" --timeout="*) ;;  # caller chose
+    *) set -- --timeout 10 "$@" ;;
+esac
+
 # ── Build parallelism ────────────────────────────────────────────────────────
 #
 # cargo-mutants parallelises builds across NCPUS by default. That is the wrong
