@@ -58,6 +58,35 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::doc_markdown)]
+// ── Panic discipline ─────────────────────────────────────────────────────────
+//
+// This library is reachable from untrusted input: the daemon hands socket
+// bytes to the same code paths a caller reaches in process. A panic on the
+// inference thread takes the engine down for *every* client, so "does not
+// panic" is a property worth having the compiler enforce rather than review
+// for.
+//
+// The crate already satisfies this — the only two `expect`s outside test code
+// are infallible and carry an `#[allow]` with the reason at the call site.
+// These lints exist to keep it that way, not to schedule work.
+//
+// Scoped to the library crate rather than `[lints.clippy]` in Cargo.toml so
+// they do not apply to `tests/`, `examples/` or the daemon binary, where a
+// panic is an assertion or a startup abort rather than a fault. The in-crate
+// `#[cfg(test)] mod tests` blocks *are* part of this crate, so each carries
+// its own `allow`.
+//
+// Note what this cannot catch: a panic raised inside a dependency. The real
+// untrusted-input hazard here is `LlamaSampler::grammar`, which panics on a
+// malformed GBNF arriving over the socket — handled explicitly with
+// `catch_unwind` in `inference::build_grammar_sampler`, not by these lints.
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+// Every `unsafe` block states why it is sound. The crate's only production
+// unsafe is the llama.cpp log callback; the rest is `env::set_var` in tests,
+// which edition 2024 makes unsafe.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod client;
 pub mod config;

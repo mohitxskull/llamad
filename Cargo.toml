@@ -91,6 +91,19 @@ opt-level = 2
 # crate's dependencies for the sake of docs.rs.
 no-default-features = true
 
+[lints.rust]
+# Unsafe discipline, enforced by the compiler rather than by review. The crate
+# already complies — every `unsafe` operation sits in an explicit block, and
+# there are no redundant ones — so these cost nothing today and prevent the
+# discipline from eroding. `deny`, not `warn`: unlike a clippy lint, these are
+# rustc lints whose meaning is fixed, so denying them cannot be broken by a
+# later toolchain adding diagnostics.
+#
+# `invalid_reference_casting` is deliberately absent: rustc already denies it
+# by default, and restating it would imply the others are similarly redundant.
+unsafe_op_in_unsafe_fn = "deny"
+unused_unsafe = "deny"
+
 [lints.clippy]
 # `warn`, not `deny`: a future clippy release that adds a lint must not break
 # downstream builds. CI runs `cargo clippy -- -D warnings` to keep this clean.

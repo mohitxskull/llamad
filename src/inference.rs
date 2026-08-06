@@ -107,9 +107,14 @@ impl Slot {
             return Ok(None);
         }
         let complete: Vec<u8> = self.utf8_buf.drain(..valid).collect();
-        Ok(Some(
-            String::from_utf8(complete).expect("prefix up to valid_up_to is valid utf-8"),
-        ))
+        // `valid` came from `valid_up_to`, so this conversion cannot fail.
+        // Surfaced as an error rather than unwrapped anyway: the two costs are
+        // not symmetric — a panic here unwinds the inference thread and takes
+        // the engine down for every client, where an error ends only this
+        // request. The branch is unreachable today and cheap to keep correct.
+        String::from_utf8(complete)
+            .map(Some)
+            .map_err(|e| LlamaError::Inference(format!("internal: utf-8 prefix invalid: {e}")))
     }
 
     /// Byte offset of the earliest completed stop sequence, or `None`.
@@ -681,6 +686,10 @@ fn inference_loop(
         _user_data: *mut std::os::raw::c_void,
     ) {
         let msg = if !text.is_null() {
+            // SAFETY: llama.cpp calls this with a NUL-terminated C string it
+            // owns and keeps valid for the duration of the call; the null case
+            // is excluded by the branch above. `to_string_lossy().into_owned()`
+            // copies before returning, so nothing borrows `text` afterwards.
             unsafe { CStr::from_ptr(text) }
                 .to_string_lossy()
                 .into_owned()
@@ -1369,6 +1378,14 @@ impl Engine {
     ///
     /// If called after [`Engine::shutdown`], which consumes the engine — so
     /// this cannot happen through the public API.
+    // Unlike the utf-8 case above, this one cannot degrade to an error without
+    // changing the return type, and `Option<&Sender>` would push an
+    // always-`Some` unwrap onto every caller instead of removing it. `shutdown`
+    // takes `self` by value, so no `&self` can outlive the `None` state.
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: `cmd_tx` is only taken by `stop`, which runs behind `shutdown(self)` or `drop`"
+    )]
     pub fn sender(&self) -> &mpsc::Sender<InferCmd> {
         self.cmd_tx.as_ref().expect("sender taken only on shutdown")
     }
@@ -1449,6 +1466,12 @@ pub fn start_inference(model_path: impl AsRef<Path>) -> Result<Engine> {
 
 #[cfg(test)]
 mod tests {
+    // Panics are the assertion mechanism in tests: a failed `unwrap` here is a
+    // reported failure, not a fault reachable from untrusted input. The
+    // crate-level denies in `lib.rs` cover the library's production paths,
+    // which is the surface that matters.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
 
     /// A blank slot: no channels, no stop sequences, greedy sampler.
