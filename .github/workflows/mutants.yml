@@ -41,6 +41,28 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-mutants
 
+      # The first dispatched run died with "the runner has received a shutdown
+      # signal" ~90 seconds into testing mutants. A hosted runner has ~14 GB of
+      # free disk; a build tree for this crate is ~6 GB, cargo-mutants keeps a
+      # scratch copy alongside the cached one, and llama.cpp objects carry full
+      # debuginfo. Reclaiming the preinstalled SDKs nobody here uses buys back
+      # more than 20 GB, which is the difference between finishing and being
+      # killed.
+      #
+      # Inline rather than a third-party action: it is four `rm`s, and this
+      # workflow should not grow a supply-chain dependency to delete files.
+      - name: Reclaim runner disk
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          echo "after:"; df -h / | tail -1
+
+      # Debuginfo is the bulk of the build tree and mutation testing never
+      # reads a backtrace — it only cares whether the suite passed or failed.
+      - name: Build without debuginfo
+        run: echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
+
       # `continue-on-error`, deliberately. Survivors are expected: the test
       # command is `cargo test --lib` (see .cargo/mutants.toml), so anything
       # only reachable with a GGUF loaded — most of the decode loop — survives
