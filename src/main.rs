@@ -67,14 +67,14 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let program = args.first().map_or("llamad", String::as_str);
 
-    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
+    // A missing model path is a usage error; an explicit --help is not.
+    if args.len() < 2 {
         usage(program);
-        // A missing model path is a usage error, not a successful run.
-        return if args.len() < 2 {
-            std::process::exit(2);
-        } else {
-            Ok(())
-        };
+        std::process::exit(2);
+    }
+    if args[1] == "--help" || args[1] == "-h" {
+        usage(program);
+        return Ok(());
     }
 
     let model_path = &args[1];
