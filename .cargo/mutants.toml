@@ -5,22 +5,29 @@
 # here already — `test_kv_cache_env_true_spellings_flip_from_disabled` asserted
 # nothing, because `from_env`'s default was already `true`.
 #
-# ── Read this before running it ──────────────────────────────────────────────
+# ── Run it through the wrapper, not directly ─────────────────────────────────
 #
-# The settings below exist because an unconfigured run took a machine down.
-# cargo-mutants rebuilds and re-tests the crate once per mutant; the default
-# test command here would be `cargo test`, which runs the real-model suite, and
-# each of those tests loads a 150 MB–730 MB GGUF and spins up llama.cpp worker
-# threads. Multiply that by concurrent mutants and the box runs out of memory.
+#     ./scripts/mutants.sh                      # whole crate
+#     ./scripts/mutants.sh --file src/config.rs # one module while iterating
 #
-# So: the test command is pinned to `--lib`, which loads no model at all.
+# `cargo mutants` on its own will freeze a typical Linux workstation, and the
+# reason is not obvious from the symptom. cargo-mutants copies the tree into
+# $TMPDIR and builds there; /tmp is a tmpfs on most desktops; a build tree for
+# this crate is ~6 GB because llama.cpp is compiled from source with full
+# debuginfo. That goes into RAM, and the machine dies.
 #
-# Run it as:
+# It is worth being explicit about what does *not* help, because all three look
+# plausible and all three were tried: `nice`, capping `--jobs`, and restricting
+# the test command. None of them matter — it is neither a CPU nor a parallelism
+# problem, and it happens with no model loaded. Only moving $TMPDIR onto disk
+# fixes it, which is all the wrapper does.
 #
-#     cargo mutants                      # reads this file; safe
-#     cargo mutants --file src/config.rs # narrow to one module while iterating
+# CI runs this weekly (.github/workflows/mutants.yml), where /tmp is
+# disk-backed and the default is already safe.
 #
-# and do NOT run a real-model `cargo test` at the same time.
+# The test command below is pinned to `--lib` for a second, independent reason:
+# the real-model suite loads a 150 MB–730 MB GGUF per test, and re-running that
+# once per mutant would take hours.
 
 # Only the in-crate unit suite. No GGUF is loaded, so memory stays flat and a
 # mutant's test run takes milliseconds rather than minutes.
