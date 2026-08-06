@@ -342,616 +342,22 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-// The existing suite drives a Unix domain socket directly. The Windows
-// transport has its own module below; the protocol assertions are duplicated
-// rather than shared because the listener types have no common trait to
-// abstract over — a named-pipe server handle becomes the connection, a Unix
-// listener yields one.
-#[cfg(all(test, unix))]
-mod tests {
+// Test helpers with no transport in them, shared by the Unix and Windows
+// suites below. Hoisted rather than duplicated per platform: the mock engine's
+// echo behaviour is what both suites assert against, so a change to one that
+// missed the other would silently weaken the transport it was not updated for.
+// This module compiles on every platform, so Linux CI type-checks the copy the
+// Windows suite uses.
+#[cfg(test)]
+mod test_support {
     use super::*;
     use std::thread;
-    use std::time::Duration;
 
     use crate::protocol::InferResult;
 
-    fn spawn_mock_inference() -> mpsc::Sender<InferCmd> {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for cmd in rx {
-                match cmd {
-                    InferCmd::Run { request, resp } => {
-                        let result = InferResult {
-                            text: format!("echo: {}", request.prompt),
-                            prompt_tokens: 5,
-                            generated_tokens: 2,
-                        };
-                        let _ = resp.send(Ok(result));
-                    }
-                    InferCmd::RunStream {
-                        request,
-                        token_tx,
-                        done_tx,
-                    } => {
-                        for ch in request.prompt.chars() {
-                            let _ = token_tx.send(ch.to_string());
-                        }
-                        if let Some(done) = done_tx {
-                            let _ = done.send(Ok(InferResult {
-                                text: format!("echo: {}", request.prompt),
-                                prompt_tokens: 5,
-                                generated_tokens: request.prompt.len(),
-                            }));
-                        }
-                        drop(token_tx);
-                    }
-                    InferCmd::Shutdown => break,
-                }
-            }
-        });
-        tx
-    }
-
-    // ── bind_socket ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_bind_socket_creates_listener() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test.sock");
-        let _ = std::fs::remove_file(&path);
-
-        let listener = bind_socket(path.to_str().unwrap()).unwrap();
-        assert!(path.exists());
-        drop(listener);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_bind_socket_reclaims_stale_socket() {
-        // A crashed daemon leaves a socket file with nobody listening. That
-        // one is safe to unlink and rebind.
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("stale.sock");
-        let _ = std::fs::remove_file(&path);
-
-        let dead = UnixListener::bind(&path).unwrap();
-        drop(dead); // tokio does not unlink on drop — the file survives
-        assert!(path.exists(), "stale socket file should remain");
-
-        let listener = bind_socket(&path).unwrap();
-        assert!(path.exists());
-        drop(listener);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_bind_socket_refuses_to_unlink_a_regular_file() {
-        // The default socket path is in /tmp. Blindly unlinking whatever sits
-        // at that name lets any local user get the daemon to delete a file.
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("not-a-socket");
-        std::fs::write(&path, b"important").unwrap();
-
-        let err = bind_socket(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("not a socket"),
-            "expected a not-a-socket refusal, got: {err}"
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"important",
-            "the file must not have been touched"
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_bind_socket_refuses_a_live_daemons_path() {
-        // Rebinding over a socket someone is still listening on would
-        // silently hijack that daemon's incoming connections.
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("live.sock");
-        let _ = std::fs::remove_file(&path);
-
-        let live = bind_socket(&path).unwrap();
-        let err = bind_socket(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("running daemon"),
-            "expected an in-use refusal, got: {err}"
-        );
-        drop(live);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_bind_socket_is_owner_only() {
-        // The socket accepts inference requests; in a world-writable
-        // directory a permissive mode hands the model to any local user.
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("perms.sock");
-        let _ = std::fs::remove_file(&path);
-
-        let listener = bind_socket(&path).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "socket mode was {:o}", mode & 0o777);
-        drop(listener);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn test_request_over_size_cap_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("too-big.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let cmd_tx = mpsc::channel::<InferCmd>().0;
-
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmd_tx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        // A valid-looking request whose body exceeds the cap.
-        let oversized = format!(
-            r#"{{"prompt":"{}"}}"#,
-            "a".repeat(MAX_REQUEST_BYTES as usize + 16)
-        );
-        // The server stops reading at the cap, so the client's write may fail
-        // once the receive buffer fills — that is the intended backpressure.
-        let _ = client.write_all(oversized.as_bytes()).await;
-        let _ = client.shutdown().await;
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert!(
-            resp["error"].as_str().unwrap().contains("too large"),
-            "expected a size-cap rejection, got: {resp}"
-        );
-
-        server.await.unwrap();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    // ── protocol round-trip with mock inference ──────────────────────────
-
-    #[tokio::test]
-    async fn test_protocol_non_streaming_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("non-stream.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let cmd_tx = spawn_mock_inference();
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(resp["text"], "echo: hello world");
-        assert_eq!(resp["prompt_tokens"], 5);
-        assert_eq!(resp["generated_tokens"], 2);
-        assert!(resp.get("done").is_none());
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_newline_terminated_request_without_half_close() {
-        // The mechanism Windows depends on. A named-pipe client cannot
-        // half-close, so the request has to be able to end at a newline while
-        // the connection stays open in both directions. Exercised here on a
-        // Unix socket because the framing is transport-independent — if this
-        // breaks, the Windows daemon deadlocks.
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("newline-frame.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let cmd_tx = spawn_mock_inference();
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
-        // Note: no `shutdown()`. The newline is the only end-of-request signal.
-        client
-            .write_all(format!("{req}\n").as_bytes())
-            .await
-            .unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(resp["text"], "echo: hello world");
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_streaming_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("stream.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let cmd_tx = spawn_mock_inference();
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "hi", "stream": true});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let output = String::from_utf8_lossy(&buf);
-
-        let lines: Vec<&str> = output.lines().collect();
-        assert!(lines.len() >= 2, "expected at least 2 lines, got {lines:?}");
-        assert_eq!(lines[0], r#"{"token":"h"}"#);
-        assert_eq!(lines[1], r#"{"token":"i"}"#);
-
-        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-        assert_eq!(last["done"], true);
-        assert_eq!(last["text"], "echo: hi");
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_invalid_json_returns_error() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("bad-json.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let cmd_tx = mpsc::channel::<InferCmd>().0;
-
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmd_tx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        client.write_all(b"not valid json at all").await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert!(resp["error"].as_str().unwrap().contains("invalid request"));
-
-        server.await.unwrap();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_empty_request_returns_error() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("empty.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let cmd_tx = mpsc::channel::<InferCmd>().0;
-
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmd_tx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(resp["error"], "empty request");
-
-        server.await.unwrap();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_inference_thread_unavailable_non_streaming() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("no-infer.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
-        drop(cmd_rx);
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "hi"});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert!(resp["error"].as_str().unwrap().contains("unavailable"));
-
-        server.await.unwrap();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_inference_thread_unavailable_streaming() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("no-stream.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
-        drop(cmd_rx);
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "hi", "stream": true});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert!(resp["error"].as_str().unwrap().contains("unavailable"));
-
-        server.await.unwrap();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_inference_error_propagates() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("infer-err.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
-
-        thread::spawn(move || {
-            for cmd in cmd_rx {
-                if let InferCmd::Run { resp, .. } = cmd {
-                    let _ = resp.send(Err(LlamaError::Inference("model exploded".into())));
-                }
-            }
-        });
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "crash me"});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert!(resp["error"].as_str().unwrap().contains("model exploded"));
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_streaming_inference_error_propagates() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("stream-infer-err.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
-
-        thread::spawn(move || {
-            for cmd in cmd_rx {
-                if let InferCmd::RunStream {
-                    token_tx, done_tx, ..
-                } = cmd
-                {
-                    let _ = token_tx.send("partial ".to_string());
-                    if let Some(done) = done_tx {
-                        let _ = done.send(Err(LlamaError::Inference(
-                            "model exploded mid-stream".into(),
-                        )));
-                    }
-                    drop(token_tx);
-                }
-            }
-        });
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "crash", "stream": true});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let output = String::from_utf8_lossy(&buf);
-
-        let lines: Vec<&str> = output.lines().collect();
-        assert!(!lines.is_empty(), "expected at least 1 line, got {lines:?}");
-        assert_eq!(lines[0], r#"{"token":"partial "}"#);
-        let err_line: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-        assert!(
-            err_line["error"]
-                .as_str()
-                .unwrap()
-                .contains("model exploded mid-stream")
-        );
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    #[tokio::test]
-    async fn test_protocol_streaming_done_tx_dropped() {
-        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let socket_path = dir.join("stream-crash.sock");
-        let _ = std::fs::remove_file(&socket_path);
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
-
-        thread::spawn(move || {
-            for cmd in cmd_rx {
-                if let InferCmd::RunStream { token_tx, .. } = cmd {
-                    drop(token_tx);
-                }
-            }
-        });
-
-        let cmdtx = cmd_tx.clone();
-        let path = socket_path.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            handle_connection(&mut stream, &cmdtx).await;
-        });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"prompt": "hi", "stream": true});
-        client.write_all(req.to_string().as_bytes()).await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert!(
-            resp["error"]
-                .as_str()
-                .unwrap()
-                .contains("ended unexpectedly")
-        );
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
-        let _ = std::fs::remove_file(&socket_path);
-    }
-}
-
-// The Windows named-pipe transport. Mirrors the protocol assertions of the
-// Unix suite above against the other listener type.
-//
-// These do not run on the maintainer's machine — CI's `windows-latest` runner
-// is what verifies them, which is the whole reason the cross-platform job
-// exists. Treat a failure here as a real bug, not runner flakiness.
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-    use std::thread;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::windows::named_pipe::ClientOptions;
-
-    use crate::protocol::{InferCmd, InferResult};
-
-    /// A pipe name unique to this process and test, so a parallel test run
-    /// cannot collide in the flat `\\.\pipe\` namespace.
-    fn pipe_name(tag: &str) -> String {
-        format!(r"\\.\pipe\llamad-test-{}-{}", std::process::id(), tag)
-    }
-
-    /// Same echo behaviour as the Unix suite's mock; duplicated because the
-    /// two test modules are compiled on different platforms.
-    fn spawn_mock_inference() -> mpsc::Sender<InferCmd> {
+    /// An "inference thread" that echoes the prompt back, so the protocol can
+    /// be exercised without loading a model.
+    pub(super) fn spawn_mock_inference() -> mpsc::Sender<InferCmd> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for cmd in rx {
@@ -987,6 +393,441 @@ mod windows_tests {
         tx
     }
 
+    /// A sender whose receiver is already dropped, so every send fails — the
+    /// "inference thread is gone" condition.
+    pub(super) fn dead_sender() -> mpsc::Sender<InferCmd> {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        tx
+    }
+}
+
+// The existing suite drives a Unix domain socket directly. The Windows
+// transport has its own module below; the protocol assertions are duplicated
+// rather than shared because the listener types have no common trait to
+// abstract over — a named-pipe server handle becomes the connection, a Unix
+// listener yields one.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::test_support::{dead_sender, spawn_mock_inference};
+    use super::*;
+    use std::path::PathBuf;
+    use std::thread;
+
+    /// A socket path unique to this process and test, in a temp directory that
+    /// already exists. The `tag` keeps parallel tests in one binary from
+    /// colliding on a name.
+    fn socket_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("llamad-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{tag}.sock"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Serve exactly one connection at a fresh socket path, run `client_body`
+    /// against it, and clean up.
+    ///
+    /// No sleep before connecting: `bind_socket` returns a *listening* socket,
+    /// so the kernel queues a connect that arrives before the accept task is
+    /// scheduled. The 100 ms sleeps this replaces were not synchronizing
+    /// anything — they only made the suite a second slower.
+    async fn with_server<F, Fut>(tag: &str, cmd_tx: mpsc::Sender<InferCmd>, client_body: F)
+    where
+        F: FnOnce(tokio::net::UnixStream) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let path = socket_path(tag);
+        let listener = bind_socket(&path).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            handle_connection(&mut stream, &cmd_tx).await;
+        });
+
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect to test socket");
+        client_body(client).await;
+
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Send `request` (newline-framed), read the whole reply, and return it.
+    async fn round_trip(mut client: tokio::net::UnixStream, request: &str) -> String {
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write request");
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.expect("read reply");
+        String::from_utf8(buf).expect("reply is utf-8")
+    }
+
+    /// The single JSON object a non-streaming reply consists of.
+    async fn round_trip_json(client: tokio::net::UnixStream, request: &str) -> serde_json::Value {
+        let raw = round_trip(client, request).await;
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("reply {raw:?} is not JSON: {e}"))
+    }
+
+    // ── bind_socket ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_bind_socket_creates_listener() {
+        let path = socket_path("creates");
+        let listener = bind_socket(&path).unwrap();
+        assert!(path.exists());
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_bind_socket_reclaims_stale_socket() {
+        // A crashed daemon leaves a socket file with nobody listening. That
+        // one is safe to unlink and rebind.
+        let path = socket_path("stale");
+        let dead = UnixListener::bind(&path).unwrap();
+        drop(dead); // tokio does not unlink on drop — the file survives
+        assert!(path.exists(), "stale socket file should remain");
+
+        let listener = bind_socket(&path).unwrap();
+        assert!(path.exists());
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_bind_socket_refuses_to_unlink_a_regular_file() {
+        // The default socket path is in /tmp. Blindly unlinking whatever sits
+        // at that name lets any local user get the daemon to delete a file.
+        let path = socket_path("not-a-socket");
+        std::fs::write(&path, b"important").unwrap();
+
+        let err = bind_socket(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("not a socket"),
+            "expected a not-a-socket refusal, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"important",
+            "the file must not have been touched"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_bind_socket_refuses_a_live_daemons_path() {
+        // Rebinding over a socket someone is still listening on would
+        // silently hijack that daemon's incoming connections.
+        let path = socket_path("live");
+        let live = bind_socket(&path).unwrap();
+        let err = bind_socket(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("running daemon"),
+            "expected an in-use refusal, got: {err}"
+        );
+        drop(live);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_bind_socket_is_owner_only() {
+        // The socket accepts inference requests; in a world-writable
+        // directory a permissive mode hands the model to any local user.
+        let path = socket_path("perms");
+        let listener = bind_socket(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "socket mode was {:o}", mode & 0o777);
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── request framing ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_request_over_size_cap_is_rejected() {
+        with_server("too-big", dead_sender(), |mut client| async move {
+            let oversized = format!(
+                r#"{{"prompt":"{}"}}"#,
+                "a".repeat(MAX_REQUEST_BYTES as usize + 16)
+            );
+            // The server stops reading at the cap, so the client's write may
+            // fail once the receive buffer fills — that is the intended
+            // backpressure, and the reply still arrives.
+            let _ = client.write_all(oversized.as_bytes()).await;
+            let _ = client.shutdown().await;
+
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+            assert!(
+                resp["error"].as_str().unwrap().contains("too large"),
+                "expected a size-cap rejection, got: {resp}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_half_closed_request_is_framed_by_eof() {
+        // The original framing, still supported: a client that half-closes its
+        // write side ends the request at EOF, with no trailing newline.
+        with_server(
+            "half-close",
+            spawn_mock_inference(),
+            |mut client| async move {
+                let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
+                client.write_all(req.to_string().as_bytes()).await.unwrap();
+                client.shutdown().await.unwrap();
+
+                let mut buf = Vec::new();
+                client.read_to_end(&mut buf).await.unwrap();
+                let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                assert_eq!(resp["text"], "echo: hello world");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_newline_terminated_request_without_half_close() {
+        // The mechanism Windows depends on. A named-pipe client cannot
+        // half-close, so the request has to be able to end at a newline while
+        // the connection stays open in both directions. Exercised here on a
+        // Unix socket because the framing is transport-independent — if this
+        // breaks, the Windows daemon deadlocks.
+        with_server(
+            "newline-frame",
+            spawn_mock_inference(),
+            |client| async move {
+                let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
+                let resp = round_trip_json(client, &req.to_string()).await;
+                assert_eq!(resp["text"], "echo: hello world");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_every_reply_is_newline_terminated() {
+        // Reply framing mirrors request framing: a client must be able to stop
+        // at the newline instead of reading to EOF, which a named pipe cannot
+        // signal without dropping the connection.
+        with_server("reply-frame", spawn_mock_inference(), |client| async move {
+            let req = serde_json::json!({"prompt": "hi"});
+            let raw = round_trip(client, &req.to_string()).await;
+            assert!(raw.ends_with('\n'), "reply was not terminated: {raw:?}");
+        })
+        .await;
+    }
+
+    // ── protocol round-trip with mock inference ──────────────────────────
+
+    #[tokio::test]
+    async fn test_protocol_non_streaming_roundtrip() {
+        with_server("non-stream", spawn_mock_inference(), |client| async move {
+            let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
+            let resp = round_trip_json(client, &req.to_string()).await;
+            assert_eq!(resp["text"], "echo: hello world");
+            assert_eq!(resp["prompt_tokens"], 5);
+            assert_eq!(resp["generated_tokens"], 2);
+            assert!(resp.get("done").is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_streaming_roundtrip() {
+        with_server("stream", spawn_mock_inference(), |client| async move {
+            let req = serde_json::json!({"prompt": "hi", "stream": true});
+            let output = round_trip(client, &req.to_string()).await;
+
+            let lines: Vec<&str> = output.lines().collect();
+            assert!(lines.len() >= 2, "expected at least 2 lines, got {lines:?}");
+            assert_eq!(lines[0], r#"{"token":"h"}"#);
+            assert_eq!(lines[1], r#"{"token":"i"}"#);
+
+            let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert_eq!(last["done"], true);
+            assert_eq!(last["text"], "echo: hi");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_invalid_json_returns_error() {
+        with_server("bad-json", dead_sender(), |client| async move {
+            let resp = round_trip_json(client, "not valid json at all").await;
+            assert!(resp["error"].as_str().unwrap().contains("invalid request"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_empty_request_returns_error() {
+        with_server("empty", dead_sender(), |mut client| async move {
+            // Nothing written at all: the frame ends immediately at EOF.
+            client.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+            assert_eq!(resp["error"], "empty request");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_inference_thread_unavailable_non_streaming() {
+        with_server("no-infer", dead_sender(), |client| async move {
+            let req = serde_json::json!({"prompt": "hi"});
+            let resp = round_trip_json(client, &req.to_string()).await;
+            assert!(resp["error"].as_str().unwrap().contains("unavailable"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_inference_thread_unavailable_streaming() {
+        with_server("no-stream", dead_sender(), |client| async move {
+            let req = serde_json::json!({"prompt": "hi", "stream": true});
+            let resp = round_trip_json(client, &req.to_string()).await;
+            assert!(resp["error"].as_str().unwrap().contains("unavailable"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_inference_error_propagates() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
+        thread::spawn(move || {
+            for cmd in cmd_rx {
+                if let InferCmd::Run { resp, .. } = cmd {
+                    let _ = resp.send(Err(LlamaError::Inference("model exploded".into())));
+                }
+            }
+        });
+
+        with_server("infer-err", cmd_tx, |client| async move {
+            let req = serde_json::json!({"prompt": "crash me"});
+            let resp = round_trip_json(client, &req.to_string()).await;
+            assert!(resp["error"].as_str().unwrap().contains("model exploded"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_streaming_inference_error_propagates() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
+        thread::spawn(move || {
+            for cmd in cmd_rx {
+                if let InferCmd::RunStream {
+                    token_tx, done_tx, ..
+                } = cmd
+                {
+                    let _ = token_tx.send("partial ".to_string());
+                    if let Some(done) = done_tx {
+                        let _ = done.send(Err(LlamaError::Inference(
+                            "model exploded mid-stream".into(),
+                        )));
+                    }
+                    drop(token_tx);
+                }
+            }
+        });
+
+        with_server("stream-infer-err", cmd_tx, |client| async move {
+            let req = serde_json::json!({"prompt": "crash", "stream": true});
+            let output = round_trip(client, &req.to_string()).await;
+
+            let lines: Vec<&str> = output.lines().collect();
+            assert!(!lines.is_empty(), "expected at least 1 line, got {lines:?}");
+            assert_eq!(lines[0], r#"{"token":"partial "}"#);
+            let err_line: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert!(
+                err_line["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("model exploded mid-stream")
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_streaming_done_tx_dropped() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
+        thread::spawn(move || {
+            for cmd in cmd_rx {
+                if let InferCmd::RunStream { token_tx, .. } = cmd {
+                    drop(token_tx);
+                }
+            }
+        });
+
+        with_server("stream-crash", cmd_tx, |client| async move {
+            let req = serde_json::json!({"prompt": "hi", "stream": true});
+            let resp = round_trip_json(client, &req.to_string()).await;
+            assert!(
+                resp["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ended unexpectedly")
+            );
+        })
+        .await;
+    }
+}
+
+// The Windows named-pipe transport. Mirrors the protocol assertions of the
+// Unix suite above against the other listener type.
+//
+// These do not run on the maintainer's machine — CI's `windows-latest` runner
+// is what verifies them, which is the whole reason the cross-platform job
+// exists. Treat a failure here as a real bug, not runner flakiness.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::test_support::spawn_mock_inference;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    use crate::protocol::InferCmd;
+
+    /// A pipe name unique to this process and test, so a parallel test run
+    /// cannot collide in the flat `\\.\pipe\` namespace.
+    fn pipe_name(tag: &str) -> String {
+        format!(r"\\.\pipe\llamad-test-{}-{}", std::process::id(), tag)
+    }
+
+    /// Serve exactly one connection on a fresh pipe and return the whole reply
+    /// to `request`.
+    ///
+    /// The request is newline-framed and the client never closes its write
+    /// side: a named pipe has no half-close, so this is the only framing the
+    /// transport can express — the property the Unix suite's
+    /// `test_newline_terminated_request_without_half_close` guards from the
+    /// other side.
+    async fn round_trip(tag: &str, cmd_tx: mpsc::Sender<InferCmd>, request: &str) -> String {
+        let name = pipe_name(tag);
+        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
+        let server = tokio::spawn(async move {
+            server_pipe.connect().await.expect("client attach");
+            handle_connection(&mut server_pipe, &cmd_tx).await;
+        });
+
+        let mut client = ClientOptions::new().open(&name).expect("open pipe");
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write request");
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.expect("read reply");
+        server.await.expect("server task");
+        String::from_utf8(buf).expect("reply is utf-8")
+    }
+
     #[tokio::test]
     async fn test_bind_pipe_refuses_a_duplicate_first_instance() {
         // The named-pipe equivalent of refusing to steal a live daemon's
@@ -1001,58 +842,28 @@ mod windows_tests {
 
     #[tokio::test]
     async fn test_protocol_non_streaming_roundtrip_over_pipe() {
-        let name = pipe_name("nonstream");
-        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
-        let cmd_tx = spawn_mock_inference();
-        let cmdtx = cmd_tx.clone();
-
-        let server = tokio::spawn(async move {
-            server_pipe.connect().await.expect("client attach");
-            handle_connection(&mut server_pipe, &cmdtx).await;
-        });
-
-        let mut client = ClientOptions::new().open(&name).expect("open pipe");
         let req = serde_json::json!({"prompt": "hello world", "max_tokens": 10});
-        // No `shutdown()` — a named pipe has no half-close, so the trailing
-        // newline is the only thing that ends the request.
-        client
-            .write_all(format!("{req}\n").as_bytes())
-            .await
-            .unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let raw = round_trip("nonstream", spawn_mock_inference(), &req.to_string()).await;
+        let resp: serde_json::Value = serde_json::from_str(raw.trim_end()).unwrap();
         assert_eq!(resp["text"], "echo: hello world");
         assert_eq!(resp["prompt_tokens"], 5);
         assert_eq!(resp["generated_tokens"], 2);
+    }
 
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
+    #[tokio::test]
+    async fn test_every_reply_is_newline_terminated_over_pipe() {
+        // Reply framing matters more here than on Unix: without a terminator a
+        // pipe client cannot tell "reply complete" from "more coming" short of
+        // waiting for the server to drop the connection.
+        let req = serde_json::json!({"prompt": "hi"});
+        let raw = round_trip("replyframe", spawn_mock_inference(), &req.to_string()).await;
+        assert!(raw.ends_with('\n'), "reply was not terminated: {raw:?}");
     }
 
     #[tokio::test]
     async fn test_protocol_streaming_roundtrip_over_pipe() {
-        let name = pipe_name("stream");
-        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
-        let cmd_tx = spawn_mock_inference();
-        let cmdtx = cmd_tx.clone();
-
-        let server = tokio::spawn(async move {
-            server_pipe.connect().await.expect("client attach");
-            handle_connection(&mut server_pipe, &cmdtx).await;
-        });
-
-        let mut client = ClientOptions::new().open(&name).expect("open pipe");
         let req = serde_json::json!({"prompt": "hi", "stream": true});
-        client
-            .write_all(format!("{req}\n").as_bytes())
-            .await
-            .unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let output = String::from_utf8_lossy(&buf);
+        let output = round_trip("stream", spawn_mock_inference(), &req.to_string()).await;
 
         let lines: Vec<&str> = output.lines().collect();
         assert!(lines.len() >= 2, "expected at least 2 lines, got {lines:?}");
@@ -1062,35 +873,15 @@ mod windows_tests {
         let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!(last["done"], true);
         assert_eq!(last["text"], "echo: hi");
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
     }
 
     #[tokio::test]
     async fn test_invalid_json_returns_error_over_pipe() {
-        let name = pipe_name("badjson");
-        let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
-        let cmd_tx = spawn_mock_inference();
-        let cmdtx = cmd_tx.clone();
-
-        let server = tokio::spawn(async move {
-            server_pipe.connect().await.expect("client attach");
-            handle_connection(&mut server_pipe, &cmdtx).await;
-        });
-
-        let mut client = ClientOptions::new().open(&name).expect("open pipe");
-        client.write_all(b"{not json}\n").await.unwrap();
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let raw = round_trip("badjson", spawn_mock_inference(), "{not json}").await;
+        let resp: serde_json::Value = serde_json::from_str(raw.trim_end()).unwrap();
         assert!(
             resp["error"].as_str().unwrap().contains("invalid request"),
             "got {resp}"
         );
-
-        server.await.unwrap();
-        cmd_tx.send(InferCmd::Shutdown).ok();
     }
 }
