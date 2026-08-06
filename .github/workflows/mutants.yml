@@ -41,28 +41,16 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-mutants
 
-      # The first dispatched run died with "the runner has received a shutdown
-      # signal" ~90 seconds into testing mutants. A hosted runner has ~14 GB of
-      # free disk; a build tree for this crate is ~6 GB, cargo-mutants keeps a
-      # scratch copy alongside the cached one, and llama.cpp objects carry full
-      # debuginfo. Reclaiming the preinstalled SDKs nobody here uses buys back
-      # more than 20 GB, which is the difference between finishing and being
-      # killed.
+      # Two runs were killed ~60 seconds into testing mutants with "the runner
+      # has received a shutdown signal". The first guess was disk; the log
+      # disproved it — the runner had 88 GB free before any cleanup. It is
+      # memory: every test binary here links llama.cpp's static library, and
+      # cargo-mutants builds across NCPUS by default, so several concurrent
+      # links exhaust a 16 GB runner and the agent is killed.
       #
-      # Inline rather than a third-party action: it is four `rm`s, and this
-      # workflow should not grow a supply-chain dependency to delete files.
-      - name: Reclaim runner disk
-        run: |
-          echo "before:"; df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          echo "after:"; df -h / | tail -1
-
-      # Debuginfo is the bulk of the build tree and mutation testing never
-      # reads a backtrace — it only cares whether the suite passed or failed.
-      - name: Build without debuginfo
-        run: echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
-
+      # Serial builds fix it. The same limit is the default in
+      # scripts/mutants.sh, where `--jobserver-tasks 3` tripped a local memory
+      # watchdog partway through a run.
       # `continue-on-error`, deliberately. Survivors are expected: the test
       # command is `cargo test --lib` (see .cargo/mutants.toml), so anything
       # only reachable with a GGUF loaded — most of the decode loop — survives
@@ -72,7 +60,7 @@ jobs:
       - name: Mutation audit
         id: mutants
         continue-on-error: true
-        run: cargo mutants --no-shuffle
+        run: cargo mutants --no-shuffle --jobserver-tasks 1
 
       # The full lists matter more than the exit status — `missed.txt` is the
       # one to read, and `unviable.txt` explains anything that failed to build.
