@@ -149,6 +149,12 @@ fn read_env_bool(key: &str, default: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Panics are the assertion mechanism in tests: a failed `unwrap` here is a
+    // reported failure, not a fault reachable from untrusted input. The
+    // crate-level denies in `lib.rs` cover the library's production paths,
+    // which is the surface that matters.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
 
     /// Serializes tests that read/write `LLAMAD_*` env vars. The test harness
@@ -156,6 +162,40 @@ mod tests {
     /// would serialize them), so without this lock two env tests can
     /// interleave and tear down each other's variables mid-assertion.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The variables every env test touches. Listed once so a test that adds a
+    /// knob cannot forget to clear it and leak state into the next test.
+    const ENV_KEYS: [&str; 5] = [
+        "LLAMAD_N_SLOTS",
+        "LLAMAD_N_CTX",
+        "LLAMAD_N_THREADS",
+        "LLAMAD_N_THREADS_BATCH",
+        "LLAMAD_KV_CACHE",
+    ];
+
+    // `set_var`/`remove_var` are `unsafe` in edition 2024: a concurrent reader
+    // of the environment is UB. Wrapping them here states that precondition
+    // once instead of repeating an identical SAFETY comment at twenty-odd call
+    // sites — where the repetition would be skimmed rather than read.
+    //
+    // The precondition every caller satisfies: hold `ENV_LOCK`, which
+    // serializes the tests in this module against each other, and note that
+    // nothing else in the crate reads `LLAMAD_*` outside `from_env`.
+
+    /// Set one variable. Caller must hold [`ENV_LOCK`].
+    fn set_env(key: &str, value: &str) {
+        // SAFETY: caller holds ENV_LOCK, so no other thread in this binary is
+        // reading or writing the environment concurrently.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    /// Clear every `LLAMAD_*` variable. Caller must hold [`ENV_LOCK`].
+    fn clear_env() {
+        for key in ENV_KEYS {
+            // SAFETY: caller holds ENV_LOCK, as above.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
 
     #[test]
     fn test_defaults() {
@@ -187,13 +227,7 @@ mod tests {
     #[test]
     fn test_from_env_uses_defaults_when_unset() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized by ENV_LOCK; no other test reads these vars.
-        unsafe {
-            std::env::remove_var("LLAMAD_N_SLOTS");
-            std::env::remove_var("LLAMAD_N_CTX");
-            std::env::remove_var("LLAMAD_N_THREADS");
-            std::env::remove_var("LLAMAD_N_THREADS_BATCH");
-        }
+        clear_env();
         let cfg = InferenceConfig::from_env();
         assert_eq!(cfg.n_slots, 1);
         assert_eq!(cfg.n_ctx, 2048);
@@ -204,19 +238,12 @@ mod tests {
     fn test_from_env_reads_valid_values() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: serialized by ENV_LOCK; no other test reads these vars.
-        unsafe {
-            std::env::set_var("LLAMAD_N_SLOTS", "8");
-            std::env::set_var("LLAMAD_N_CTX", "4096");
-            std::env::set_var("LLAMAD_N_THREADS", "2");
-            std::env::set_var("LLAMAD_N_THREADS_BATCH", "6");
-        }
+        set_env("LLAMAD_N_SLOTS", "8");
+        set_env("LLAMAD_N_CTX", "4096");
+        set_env("LLAMAD_N_THREADS", "2");
+        set_env("LLAMAD_N_THREADS_BATCH", "6");
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_N_SLOTS");
-            std::env::remove_var("LLAMAD_N_CTX");
-            std::env::remove_var("LLAMAD_N_THREADS");
-            std::env::remove_var("LLAMAD_N_THREADS_BATCH");
-        }
+        clear_env();
         assert_eq!(cfg.n_slots, 8);
         assert_eq!(cfg.n_ctx, 4096);
         assert_eq!(cfg.n_threads, 2);
@@ -227,19 +254,12 @@ mod tests {
     #[test]
     fn test_from_env_ignores_invalid_values_and_clamps() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::set_var("LLAMAD_N_SLOTS", ""); // empty → default 1
-            std::env::set_var("LLAMAD_N_CTX", "0"); // parses → sane() clamps up to n_slots
-            std::env::set_var("LLAMAD_N_THREADS", "0"); // parses → sane() clamps to ≥ 1
-            std::env::set_var("LLAMAD_N_THREADS_BATCH", "banana"); // unparsable → default
-        }
+        set_env("LLAMAD_N_SLOTS", ""); // empty → default 1
+        set_env("LLAMAD_N_CTX", "0"); // parses → sane() clamps up to n_slots
+        set_env("LLAMAD_N_THREADS", "0"); // parses → sane() clamps to ≥ 1
+        set_env("LLAMAD_N_THREADS_BATCH", "banana"); // unparsable → default
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_N_SLOTS");
-            std::env::remove_var("LLAMAD_N_CTX");
-            std::env::remove_var("LLAMAD_N_THREADS");
-            std::env::remove_var("LLAMAD_N_THREADS_BATCH");
-        }
+        clear_env();
         assert_eq!(cfg.n_slots, 1); // "" empty → default
         assert_eq!(cfg.n_ctx, MIN_N_CTX); // 0 clamps up to the crash floor
         assert_eq!(cfg.n_threads, 1); // 0 clamps to ≥ 1
@@ -292,24 +312,17 @@ mod tests {
     #[test]
     fn test_from_env_clamps_upper_bounds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            // Values chosen to parse on a 32-bit `usize` as well as a 64-bit
-            // one. `4294967296` (2^32) would exceed `usize::MAX` on a 32-bit
-            // target, so `read_env` would fall back to the default and the
-            // clamp under test would never run — the test would pass for the
-            // wrong reason on one platform and fail on the other.
-            std::env::set_var("LLAMAD_N_SLOTS", "1000000"); // ≫ 512 → clamps to 512
-            std::env::set_var("LLAMAD_N_CTX", "4294967295"); // u32::MAX → clamps to 1_048_576
-            std::env::set_var("LLAMAD_N_THREADS", "2000000"); // would overflow i32 as-is → clamps to 256
-            std::env::set_var("LLAMAD_N_THREADS_BATCH", "2000000");
-        }
+        // Values chosen to parse on a 32-bit `usize` as well as a 64-bit one.
+        // `4294967296` (2^32) would exceed `usize::MAX` on a 32-bit target, so
+        // `read_env` would fall back to the default and the clamp under test
+        // would never run — the test would pass for the wrong reason on one
+        // platform and fail on the other.
+        set_env("LLAMAD_N_SLOTS", "1000000"); // ≫ 512 → clamps to 512
+        set_env("LLAMAD_N_CTX", "4294967295"); // u32::MAX → clamps to 1_048_576
+        set_env("LLAMAD_N_THREADS", "2000000"); // would overflow i32 as-is → clamps to 256
+        set_env("LLAMAD_N_THREADS_BATCH", "2000000");
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_N_SLOTS");
-            std::env::remove_var("LLAMAD_N_CTX");
-            std::env::remove_var("LLAMAD_N_THREADS");
-            std::env::remove_var("LLAMAD_N_THREADS_BATCH");
-        }
+        clear_env();
         assert_eq!(cfg.n_slots, 512);
         assert_eq!(cfg.n_ctx, 1_048_576); // still ≥ n_slots
         assert_eq!(cfg.n_threads, 256);
@@ -320,26 +333,18 @@ mod tests {
     #[test]
     fn test_kv_cache_default_on() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::remove_var("LLAMAD_KV_CACHE");
-        }
+        clear_env();
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_KV_CACHE");
-        }
+        clear_env();
         assert!(cfg.kv_cache);
     }
 
     #[test]
     fn test_kv_cache_env_disables() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::set_var("LLAMAD_KV_CACHE", "0");
-        }
+        set_env("LLAMAD_KV_CACHE", "0");
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_KV_CACHE");
-        }
+        clear_env();
         assert!(!cfg.kv_cache);
     }
 
@@ -347,13 +352,9 @@ mod tests {
     fn test_kv_cache_env_accepts_false_spellings() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         for v in ["false", "no", "off"] {
-            unsafe {
-                std::env::set_var("LLAMAD_KV_CACHE", v);
-            }
+            set_env("LLAMAD_KV_CACHE", v);
             let cfg = InferenceConfig::from_env();
-            unsafe {
-                std::env::remove_var("LLAMAD_KV_CACHE");
-            }
+            clear_env();
             assert!(!cfg.kv_cache, "{v} should disable");
         }
     }
@@ -362,43 +363,33 @@ mod tests {
     fn test_kv_cache_env_accepts_true_spellings() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         for v in ["1", "true", "yes", "on"] {
-            unsafe {
-                std::env::set_var("LLAMAD_KV_CACHE", v);
-            }
+            set_env("LLAMAD_KV_CACHE", v);
             let cfg = InferenceConfig::from_env();
-            unsafe {
-                std::env::remove_var("LLAMAD_KV_CACHE");
-            }
+            clear_env();
             assert!(cfg.kv_cache, "{v} should enable");
         }
     }
 
     #[test]
-    fn test_kv_cache_env_true_spellings_flip_from_disabled() {
+    fn test_kv_cache_env_true_spellings_are_parsed_not_defaulted() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // The default is also true, so the spellings loop alone cannot detect
-        // a dropped true-arm (every value would fall through to the default
-        // and still pass). Baseline on "0" first: each spelling must flip the
-        // bool back to true, so a missing true-arm now fails the test.
-        unsafe {
-            std::env::set_var("LLAMAD_KV_CACHE", "0");
-        }
-        let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_KV_CACHE");
-        }
-        assert!(!cfg.kv_cache, "baseline: 0 should disable");
+        // Goes through `read_env_bool` directly, with `default = false`, and
+        // that is the whole point: via `from_env` this property is untestable.
+        // `from_env` always passes `default = true`, so a true-spelling that
+        // fell through to the unrecognized-value arm would still yield `true`
+        // and the assertion would pass. An earlier version of this test tried
+        // to fix that by setting a "0" baseline first, but each iteration
+        // re-reads the environment from scratch, so the baseline never carried
+        // in — dropping the `"1" | "true" | "yes" | "on"` arm entirely left the
+        // test green. Only a `false` default distinguishes parsed-true from
+        // defaulted-true.
         for v in ["1", "true", "yes", "on"] {
-            unsafe {
-                std::env::set_var("LLAMAD_KV_CACHE", v);
-            }
-            let cfg = InferenceConfig::from_env();
-            unsafe {
-                std::env::remove_var("LLAMAD_KV_CACHE");
-            }
+            set_env("LLAMAD_KV_CACHE", v);
+            let parsed = read_env_bool("LLAMAD_KV_CACHE", false);
+            clear_env();
             assert!(
-                cfg.kv_cache,
-                "{v} should flip the disabled baseline to true"
+                parsed,
+                "{v} must be recognized as true, not fall through to the default"
             );
         }
     }
@@ -406,26 +397,18 @@ mod tests {
     #[test]
     fn test_kv_cache_env_empty_falls_back_to_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::set_var("LLAMAD_KV_CACHE", "");
-        }
+        set_env("LLAMAD_KV_CACHE", "");
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_KV_CACHE");
-        }
+        clear_env();
         assert!(cfg.kv_cache);
     }
 
     #[test]
     fn test_kv_cache_env_invalid_keeps_default() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        unsafe {
-            std::env::set_var("LLAMAD_KV_CACHE", "banana");
-        }
+        set_env("LLAMAD_KV_CACHE", "banana");
         let cfg = InferenceConfig::from_env();
-        unsafe {
-            std::env::remove_var("LLAMAD_KV_CACHE");
-        }
+        clear_env();
         assert!(cfg.kv_cache);
     }
 }

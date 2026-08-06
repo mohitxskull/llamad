@@ -316,6 +316,12 @@ impl TokenStream {
 
 #[cfg(test)]
 mod tests {
+    // Panics are the assertion mechanism in tests: a failed `unwrap` here is a
+    // reported failure, not a fault reachable from untrusted input. The
+    // crate-level denies in `lib.rs` cover the library's production paths,
+    // which is the surface that matters.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
     use crate::protocol::InferResult;
     use std::sync::mpsc;

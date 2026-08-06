@@ -350,6 +350,12 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
 // Windows suite uses.
 #[cfg(test)]
 mod test_support {
+    // Panics are the assertion mechanism in tests: a failed `unwrap` here is a
+    // reported failure, not a fault reachable from untrusted input. The
+    // crate-level denies in `lib.rs` cover the library's production paths,
+    // which is the surface that matters.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
     use std::thread;
 
@@ -409,6 +415,12 @@ mod test_support {
 // listener yields one.
 #[cfg(all(test, unix))]
 mod tests {
+    // Panics are the assertion mechanism in tests: a failed `unwrap` here is a
+    // reported failure, not a fault reachable from untrusted input. The
+    // crate-level denies in `lib.rs` cover the library's production paths,
+    // which is the surface that matters.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::test_support::{dead_sender, spawn_mock_inference};
     use super::*;
     use std::path::PathBuf;
@@ -787,6 +799,12 @@ mod tests {
 // exists. Treat a failure here as a real bug, not runner flakiness.
 #[cfg(all(test, windows))]
 mod windows_tests {
+    // Panics are the assertion mechanism in tests: a failed `unwrap` here is a
+    // reported failure, not a fault reachable from untrusted input. The
+    // crate-level denies in `lib.rs` cover the library's production paths,
+    // which is the surface that matters.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::test_support::spawn_mock_inference;
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
