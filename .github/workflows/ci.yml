@@ -234,12 +234,21 @@ jobs:
       - name: Fetch models
         run: ./models/download.sh
 
+      # One invocation, captured. Running `cargo llvm-cov` and then
+      # `cargo llvm-cov report` would either re-run the whole suite or read
+      # profraw data the first command had already cleaned up.
+      #
+      # `pipefail` so a failing test run fails the job rather than being
+      # swallowed by `tee`.
       - name: Coverage
         env:
           LLAMAD_REQUIRE_MODELS: "1"
-        run: cargo llvm-cov --all-targets --summary-only
-
-      - name: Coverage summary to the job log
-        env:
-          LLAMAD_REQUIRE_MODELS: "1"
-        run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -o pipefail
+          cargo llvm-cov --all-targets --summary-only | tee /tmp/coverage.txt
+          {
+            echo '### Coverage'
+            echo '```'
+            cat /tmp/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
