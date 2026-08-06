@@ -496,10 +496,11 @@ one family. Sampling **defaults** happen to be the Liquid AI LFM2.5 model-card
 values, and every one of them is overridable per request (see
 [Generation parameters](#generation-parameters)).
 
-What is *tested* is narrower: the LFM2.5 family plus SmolLM2-135M and
-Qwen2.5-0.5B (attention-only, used by the KV-reuse tests). KV-prefix reuse is
-probe-gated per model and degrades to full prefill on architectures that cannot
-partially rewind their KV cache — hybrid/SSM models like LFM2.5 take that path.
+What is *tested* is narrower: the LFM2.5 family (hybrid/SSM) plus
+SmolLM2-135M (pure attention, which is what makes the KV-reuse path reachable).
+KV-prefix reuse is probe-gated per model and degrades to full prefill on
+architectures that cannot partially rewind their KV cache — hybrid/SSM models
+like LFM2.5 take that path.
 The real-model test suite needs the GGUFs in `models/` (gitignored) — fetch
 them with `models/download.sh`:
 
@@ -508,7 +509,7 @@ them with `models/download.sh`:
 | [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF) | 230M | 146 MB | Mechanical tasks: classification, routing, extraction, formatting | 37–70 tok/s |
 | [LFM2.5-1.2B-Thinking](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking-GGUF) | 1.2B | 731 MB | Reasoning: math, logic, multi-step problems | 15–16 tok/s |
 
-KV prefix reuse is probe-gated per model: it engages on pure-attention GGUFs (e.g. SmolLM2, Qwen2.5 — any llama.cpp-supported attention arch) and degrades to full-prefill-per-request on hybrid/SSM/recurrent models like the LFM2.5 family (see "KV-reuse path" under Tests).
+KV prefix reuse is probe-gated per model: it engages on pure-attention GGUFs (SmolLM2 is the bundled one; any llama.cpp-supported attention arch works) and degrades to full-prefill-per-request on hybrid/SSM/recurrent models like the LFM2.5 family (see "KV-reuse path" under Tests).
 
 Single-request throughput measured 2026-07-31 on release builds (`cargo build --release --features native`, 4 physical threads, 256-token generations). Spread on the 230M is thermal/load variance between runs (avg 63 tok/s in a cool run, 39 tok/s in a warm one) — not code variance. Reproduce with the bundled benchmark harness: `cargo run --release --features native --example bench -- <model.gguf> <n_repeat> [system_prompt]` (see `examples/bench.rs`).
 
@@ -678,7 +679,7 @@ Environment variables (read once per engine at startup; unparsable values fall b
 First fetch the model fixtures (re-runnable; skips already-downloaded files):
 
 ```sh
-./models/download.sh                  # all four GGUFs (~1.4 GB)
+./models/download.sh                  # all three GGUFs (~950 MB)
 ./models/download.sh SmolLM2          # just the KV-reuse test model
 ```
 
@@ -691,34 +692,54 @@ cargo test --test integration         # real-model integration tests (LFM2.5)
 cargo test --test lifecycle           # engine/client lifecycle contracts
 cargo test --test reuse               # KV-prefix-reuse path tests (attention model)
 cargo test --test cancellation        # slot-recycling cancellation test
+cargo test --test daemon              # the llamad binary, end to end
+cargo test --test fixtures            # fixture/download.sh drift (no model needed)
 ```
 
-143 unit tests + 32 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 6 doc tests. Real model tests use the GGUFs in `models/` (paths default via `CARGO_MANIFEST_DIR`; override per-model with `LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`, or `LLAMAD_TEST_MODEL`). Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
+156 unit tests + 5 fixture-drift tests + 36 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 4 in `tests/daemon.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 6 doc tests.
 
-### KV-reuse path (`LLAMAD_TEST_MODEL` / bundled SmolLM2)
+Fixtures are named for the **capability** a test needs, not for a model's size: `HYBRID` (KV rewind unsupported — the degraded path), `HYBRID_LARGE`, and `ATTENTION` (rewind supported — reuse engages). Paths default under `CARGO_MANIFEST_DIR`; override with `LLAMAD_TEST_MODEL_HYBRID`, `LLAMAD_TEST_MODEL_HYBRID_LARGE`, or `LLAMAD_TEST_MODEL_ATTENTION`. Set `LLAMAD_REQUIRE_MODELS=1` — as CI does — to turn a missing fixture from a skip into a failure; without it a suite that tested nothing still reports as passing. `tests/fixtures.rs` checks the fixture list against `models/download.sh` in both directions, so a renamed quant and a download nothing uses are both caught. Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
 
-The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages only when the startup probe finds a model that supports partial KV rewind — which the repo's LFM2.5 hybrids do not (they run the degraded full-prefill path). The reuse-path tests in `tests/reuse.rs` run against `LLAMAD_TEST_MODEL` (an attention-only GGUF, e.g. Qwen2.5-0.5B) when set, else the bundled SmolLM2-135M in `models/` when present. With a rewind-capable model the identical-resend and partial-prefix tests exercise the real reuse path, and a dedicated test asserts the probe verdict is `true` on it (no degradation warning; reuse debug lines present). With neither model available, the reuse binary skips with a message — the degraded-path contract stays covered by `probe_verdict_degrades_loudly_on_lfm2` in `tests/integration.rs`.
+### KV-reuse path (`LLAMAD_TEST_MODEL_ATTENTION` / bundled SmolLM2)
+
+The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages only when the startup probe finds a model that supports partial KV rewind — which the repo's LFM2.5 hybrids do not (they run the degraded full-prefill path). The reuse-path tests in `tests/reuse.rs` run against `LLAMAD_TEST_MODEL_ATTENTION` (any attention-only GGUF) when set, else the bundled SmolLM2-135M in `models/`. With a rewind-capable model the identical-resend and partial-prefix tests exercise the real reuse path, and a dedicated test asserts the probe verdict is `true` on it (no degradation warning; reuse debug lines present). Without one the binary skips — and skips report as passes, so CI sets `LLAMAD_REQUIRE_MODELS=1` to make that a failure instead. The degraded-path contract stays covered by `probe_verdict_degrades_loudly_on_lfm2` in `tests/integration.rs`.
 
 ### Test coverage
 
 | Area | Tests | Description |
 |---|---|---|
-| Protocol | 17 | Deserialization, serialization round-trip, null-byte rejection, history |
+| Protocol | 20 | Deserialization, serialization round-trip, null-byte rejection, history, and the wire shape of `StreamDone` (flat, not nested) and `ErrorResponse` |
 | Preprocess | 29 | Chat templating (`build_messages`), sampling resolution and clamping, grammar validation, stop-sequence normalization, budget checks, defaults |
-| Slot lifecycle + KV reuse | 51 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback |
+| Slot lifecycle + KV reuse | 56 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback. Includes 5 **property** tests (proptest) over UTF-8 reassembly, stop-sequence hold-back and prefix matching — the areas where hand-picked examples only cover the cases someone thought of |
 | Client API | 15 | complete/complete_stream, async variants, error propagation, done-signal ordering, `Send + Sync` guard |
-| Server | 16 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, newline-framed request with no half-close (the mechanism Windows needs), size cap, error responses. A `cfg(windows)` module mirrors the protocol assertions over a named pipe; those run on the `windows-latest` CI job, not locally. |
-| Config | 15 | Env parsing, defaults, `sane()` clamping, true-spelling flip-from-disabled |
+| Server | 18 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, newline-framed request with no half-close (the mechanism Windows needs), size cap, error responses. A `cfg(windows)` module mirrors the protocol assertions over a named pipe; those run on the `windows-latest` CI job, not locally. |
+| Config | 18 | Env parsing, defaults, `sane()` clamping, true-spelling parsing (via `read_env_bool` directly — through `from_env` the property is untestable, since its default is already `true`), and the physical-core thread default |
 | Integration | 21 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility, grammar constraint (sampled + greedy + JSON) and rejection of malformed/null-byte/unknown-root grammars without killing the engine |
 | Lifecycle | 7 | Real model: two models side by side with independent configs, degenerate-config clamping, two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
 | KV reuse e2e | 3 | Real model (attention, `tests/reuse.rs`): identical resend, partial-prefix triple, reuse-engages probe verdict |
 | Cancellation | 1 | Single-slot server: slot recycled after stream drop (bounded first-token wait) |
+| Daemon binary | 4 | The real `llamad` binary via `CARGO_BIN_EXE_llamad`: socket mode `0600`, newline-framed request round-trip, NDJSON stream terminated by a done line, SIGINT exits zero and unlinks the socket, usage/`--help` exit codes |
+| Fixture drift | 5 | No model needed: the fixture list and `models/download.sh` must name the same files in *both* directions — a renamed quant and a download nothing uses are both failures |
 
 ### Test architecture
 
 - **Mock client**: A background thread processes `InferCmd`s and returns canned responses — tests run without a real model, via a test-only `Engine::from_sender`.
 - **`oneshot_bridge`**: Converts `tokio::sync::oneshot` to `std::sync::mpsc` for use in sync test contexts.
 - **Real-model tests**: Load actual GGUF files (from `models/`, fetched by `models/download.sh`) and verify token counts, temperature effects, system prompts, and multi-request batching. Serialized with `serial_test`; log-contract assertions via the capture layer in `tests/common/mod.rs`.
+- **Property tests**: `proptest` covers the two places where the failure mode is a panic on a character boundary or a silently dropped fragment. Failing seeds are committed under `tests/proptest-regressions/`, so a case found once re-runs for everyone.
+- **Mutation testing**: `cargo-mutants` answers what coverage cannot — whether a test would *fail* if the code were wrong. It has already found two real holes: a config test that asserted nothing, and a thread-count branch that was untestable in place. Run it with `./scripts/mutants.sh`, never bare — see that script for why. CI runs it weekly.
+- **Coverage**: `cargo llvm-cov` over the whole suite, real-model tests included (without them the decode loop reads as uncovered). Reported, not gated: a percentage threshold mostly rewards tests that execute lines without asserting on them.
+
+### Enforced by lints, not review
+
+The library denies `unwrap_used`, `expect_used`, `panic` and
+`undocumented_unsafe_blocks`, plus `unsafe_op_in_unsafe_fn` and
+`unused_unsafe` at the manifest. Scoped to the library crate — the surface the
+daemon exposes to socket input — so tests and the binary, where a panic is an
+assertion or a startup abort, are unaffected. What lints cannot catch is a
+panic inside a dependency: the real hazard is `LlamaSampler::grammar`, which
+panics on malformed GBNF from the socket, handled explicitly with
+`catch_unwind` in `build_grammar_sampler`.
 
 ## Contributing
 
@@ -764,7 +785,7 @@ and no model files needed.
 everywhere else, and fmt, clippy and the tests all pass straight through that.
 It is the one check that has caught a problem nothing else did.
 
-What the hook deliberately does *not* run: the real-model suite (needs ~1.4 GB
+What the hook deliberately does *not* run: the real-model suite (needs ~950 MB
 of GGUFs) and the macOS/Windows jobs. Those belong in CI. A hook slow enough to
 be irritating is a hook people bypass.
 
@@ -794,7 +815,7 @@ cargo install git-cliff          # once
    `Cargo.lock` follows.
 
 3. Run the **full** suite locally, including the real-model tests. CI cannot:
-   the GGUFs are ~1.4 GB, so `.github/workflows/ci.yml` compiles those test
+   the GGUFs are ~950 MB, so `.github/workflows/ci.yml` compiles those test
    binaries but does not run them.
 
    ```sh
