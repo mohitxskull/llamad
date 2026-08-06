@@ -2,3 +2,6 @@
 models/*
 !models/download.sh
 *.gguf
+
+# Agent session transcripts, written into the working tree by tooling.
+session-*.md
