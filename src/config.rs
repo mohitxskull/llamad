@@ -50,10 +50,32 @@ impl Default for InferenceConfig {
     }
 }
 
+/// Threads to use when the physical core count cannot be determined.
+///
+/// A conservative guess, not a target: `num_cpus::get_physical()` returning 0
+/// means the platform did not tell us, and over-subscribing an unknown machine
+/// is worse than under-using a large one.
+const FALLBACK_THREADS: usize = 4;
+
+/// Default thread count for a machine reporting `physical` physical cores.
+///
+/// Takes the count as an argument rather than calling `num_cpus` itself so
+/// both branches are testable on any host. In place, the comparison was
+/// effectively untestable: a developer machine with exactly
+/// [`FALLBACK_THREADS`] physical cores makes the two branches return the same
+/// value, so a flipped comparison behaves identically. Mutation testing found
+/// precisely that — three mutants of `physical > 0` survived on a 4-core box.
+fn default_thread_count(physical: usize) -> usize {
+    if physical > 0 {
+        physical
+    } else {
+        FALLBACK_THREADS
+    }
+}
+
 impl InferenceConfig {
     fn with_default_threads(mut self) -> Self {
-        let physical = num_cpus::get_physical();
-        let default = if physical > 0 { physical } else { 4 };
+        let default = default_thread_count(num_cpus::get_physical());
         if self.n_threads == 0 {
             self.n_threads = default;
         }
@@ -208,6 +230,59 @@ mod tests {
         assert_eq!(cfg.n_threads, cfg.n_threads_batch);
         assert!(cfg.n_threads >= 1);
         assert_eq!(cfg.per_slot_budget(), 2048);
+    }
+
+    #[test]
+    fn test_default_thread_count_uses_the_physical_cores_it_is_given() {
+        // Values deliberately unequal to FALLBACK_THREADS, so taking the wrong
+        // branch is observable. Testing this through `InferenceConfig::default`
+        // cannot achieve that: it uses whatever the host reports, and on a
+        // machine with exactly FALLBACK_THREADS cores both branches agree.
+        assert_eq!(default_thread_count(1), 1);
+        assert_eq!(default_thread_count(8), 8);
+        assert_eq!(default_thread_count(64), 64);
+        assert_ne!(
+            default_thread_count(8),
+            FALLBACK_THREADS,
+            "a known core count must not be replaced by the fallback"
+        );
+    }
+
+    #[test]
+    fn test_default_thread_count_falls_back_when_the_count_is_unknown() {
+        // `num_cpus::get_physical()` reports 0 when the platform does not say.
+        // Returning 0 from here would clamp to 1 thread in `sane()` and decode
+        // single-threaded on every such machine.
+        assert_eq!(default_thread_count(0), FALLBACK_THREADS);
+    }
+
+    #[test]
+    fn test_default_threads_track_the_physical_core_count() {
+        // Found by mutation testing: nothing asserted this, so flipping the
+        // `physical > 0` comparison in `with_default_threads` — which sends
+        // every machine down the `else { 4 }` fallback — left the suite green.
+        // `test_defaults` only checks `>= 1` and that the two counts agree,
+        // and 4 satisfies both.
+        //
+        // The consequence of that regression is quiet and expensive: a 32-core
+        // box would decode on 4 threads with no warning and no failing test.
+        // The literal 4 is a floor for the pathological `get_physical() == 0`,
+        // not a default anyone should receive.
+        let physical = num_cpus::get_physical();
+        if physical == 0 {
+            // No physical count available; the fallback is the contract here.
+            assert_eq!(InferenceConfig::default().n_threads, 4);
+            return;
+        }
+        let cfg = InferenceConfig::default();
+        assert_eq!(
+            cfg.n_threads, physical,
+            "decode threads must default to physical cores"
+        );
+        assert_eq!(
+            cfg.n_threads_batch, physical,
+            "prefill threads must default to physical cores"
+        );
     }
 
     #[test]
