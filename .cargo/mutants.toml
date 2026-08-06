@@ -1,0 +1,72 @@
+# cargo-mutants configuration.
+#
+# Mutation testing answers the question coverage cannot: not "was this line
+# executed?" but "would anything fail if it were wrong?". It found a real hole
+# here already — `test_kv_cache_env_true_spellings_flip_from_disabled` asserted
+# nothing, because `from_env`'s default was already `true`.
+#
+# ── Read this before running it ──────────────────────────────────────────────
+#
+# The settings below exist because an unconfigured run took a machine down.
+# cargo-mutants rebuilds and re-tests the crate once per mutant; the default
+# test command here would be `cargo test`, which runs the real-model suite, and
+# each of those tests loads a 150 MB–730 MB GGUF and spins up llama.cpp worker
+# threads. Multiply that by concurrent mutants and the box runs out of memory.
+#
+# So: the test command is pinned to `--lib`, which loads no model at all.
+#
+# Run it as:
+#
+#     cargo mutants                      # reads this file; safe
+#     cargo mutants --file src/config.rs # narrow to one module while iterating
+#
+# and do NOT run a real-model `cargo test` at the same time.
+
+# Only the in-crate unit suite. No GGUF is loaded, so memory stays flat and a
+# mutant's test run takes milliseconds rather than minutes.
+#
+# The tradeoff, stated so results are not misread: mutants in code that only
+# the real-model tests reach — most of the decode loop in `inference.rs` — will
+# survive here for lack of coverage, not because a test is weak. Treat
+# survivors in `config.rs`, `protocol.rs`, `preprocess.rs`, `client.rs` and the
+# pure helpers of `inference.rs` as real findings; treat survivors inside
+# `inference_loop`/`Scheduler` as "not covered by this run".
+test_tool = "cargo"
+additional_cargo_test_args = ["--lib"]
+
+# `main.rs` is the daemon's argument handling and accept loop. It is covered by
+# `tests/daemon.rs`, which spawns the real binary — and therefore loads a model,
+# which is exactly what this configuration avoids. Excluded rather than left to
+# report a screenful of survivors that only mean "not tested by --lib".
+exclude_globs = ["src/main.rs"]
+
+# The unit suite finishes in well under a second; anything past this is a
+# mutant that induced a hang (an infinite loop in the UTF-8 buffer, say) rather
+# than a slow machine. Low on purpose — a hung mutant otherwise stalls the run.
+minimum_test_timeout = 30
+
+# Test-only code. cargo-mutants parses the AST without evaluating `cfg`, so it
+# offers mutants inside `#[cfg(test)]` modules — and inside
+# `#[cfg(all(test, windows))]` ones, which do not even compile on Linux and
+# would be reported as unviable. Mutating a test helper answers nothing anyway:
+# the question is whether the tests catch changes to the *library*.
+exclude_re = [
+    "::tests::",
+    "tests::",
+    "windows_tests",
+    "test_support",
+]
+
+# ── Known-equivalent mutants ─────────────────────────────────────────────────
+#
+# Not excluded — they are cheap to re-confirm and excluding them would hide a
+# future change that makes them non-equivalent. Recorded so the next run does
+# not re-investigate:
+#
+#   config.rs  `read_env`      guard `!raw.trim().is_empty()` -> `true`
+#   config.rs  `read_env_bool` guard `raw.trim().is_empty()`  -> `false`
+#
+# Both route the empty-string case to the same value by a different path: with
+# the guard bypassed, `"".parse::<T>()` fails and `""` matches the catch-all
+# arm, each falling through to the same default. The only observable difference
+# is one extra `tracing::warn!` line, which no test asserts on and none should.

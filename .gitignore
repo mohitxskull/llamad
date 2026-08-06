@@ -5,3 +5,9 @@ models/*
 
 # Agent session transcripts, written into the working tree by tooling.
 session-*.md
+
+# cargo-mutants working directory: build output, regenerated per run.
+# (proptest-regressions/ is deliberately NOT ignored — those seeds are
+# committed so a failing case re-runs for everyone, per proptest's guidance.)
+/mutants.out
+/mutants.out.old
