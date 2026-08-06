@@ -293,10 +293,15 @@ mod tests {
     fn test_from_env_clamps_upper_bounds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
-            std::env::set_var("LLAMAD_N_SLOTS", "4294967296"); // 2^32 → truncates as u32 → clamps to 512
+            // Values chosen to parse on a 32-bit `usize` as well as a 64-bit
+            // one. `4294967296` (2^32) would exceed `usize::MAX` on a 32-bit
+            // target, so `read_env` would fall back to the default and the
+            // clamp under test would never run — the test would pass for the
+            // wrong reason on one platform and fail on the other.
+            std::env::set_var("LLAMAD_N_SLOTS", "1000000"); // ≫ 512 → clamps to 512
             std::env::set_var("LLAMAD_N_CTX", "4294967295"); // u32::MAX → clamps to 1_048_576
-            std::env::set_var("LLAMAD_N_THREADS", "3000000000"); // would overflow i32 → clamps to 256
-            std::env::set_var("LLAMAD_N_THREADS_BATCH", "3000000000");
+            std::env::set_var("LLAMAD_N_THREADS", "2000000"); // would overflow i32 as-is → clamps to 256
+            std::env::set_var("LLAMAD_N_THREADS_BATCH", "2000000");
         }
         let cfg = InferenceConfig::from_env();
         unsafe {
