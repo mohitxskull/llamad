@@ -199,7 +199,7 @@ impl Client {
         })?;
         Ok(TokenStream {
             rx: token_rx,
-            done_rx: Some(done_rx),
+            done_rx,
             text: String::new(),
         })
     }
@@ -235,7 +235,12 @@ impl Client {
 #[derive(Debug)]
 pub struct TokenStream {
     rx: mpsc::UnboundedReceiver<String>,
-    done_rx: Option<oneshot::Receiver<Result<InferResult, LlamaError>>>,
+    /// Not optional: `complete_stream` is the only constructor and always
+    /// requests a done-channel. `InferCmd::RunStream` allows `done_tx: None`
+    /// for a caller driving the engine directly, but a `TokenStream` never
+    /// takes that shape — so there is no "finished without stats" case to
+    /// represent, and `into_result` needs no fallback for one.
+    done_rx: oneshot::Receiver<Result<InferResult, LlamaError>>,
     text: String,
 }
 
@@ -285,15 +290,12 @@ impl TokenStream {
         while let Some(token) = self.rx.blocking_recv() {
             self.text.push_str(&token);
         }
-        match self.done_rx.take() {
-            // `blocking_recv`, not `try_recv`: the done signal is sent before
-            // the token channel closes today, but a `try_recv` would silently
-            // report "not received" the moment that ordering changed.
-            Some(rx) => rx
-                .blocking_recv()
-                .map_err(|_| LlamaError::InferenceCrashed)?,
-            None => Ok(self.take_partial()),
-        }
+        // `blocking_recv`, not `try_recv`: the done signal is sent before the
+        // token channel closes today, but a `try_recv` would silently report
+        // "not received" the moment that ordering changed.
+        self.done_rx
+            .blocking_recv()
+            .map_err(|_| LlamaError::InferenceCrashed)?
     }
 
     /// Drain the stream and return the final [`InferResult`], without blocking
@@ -306,20 +308,9 @@ impl TokenStream {
         while let Some(token) = self.rx.recv().await {
             self.text.push_str(&token);
         }
-        match self.done_rx.take() {
-            Some(rx) => rx.await.map_err(|_| LlamaError::InferenceCrashed)?,
-            None => Ok(self.take_partial()),
-        }
-    }
-
-    /// Result for a stream created without a done-channel: text only, with no
-    /// token accounting available.
-    fn take_partial(&mut self) -> InferResult {
-        InferResult {
-            text: std::mem::take(&mut self.text),
-            prompt_tokens: 0,
-            generated_tokens: 0,
-        }
+        self.done_rx
+            .await
+            .map_err(|_| LlamaError::InferenceCrashed)?
     }
 }
 
