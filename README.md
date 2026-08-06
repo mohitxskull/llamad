@@ -424,13 +424,21 @@ Other error forms: `invalid request` (parse failure or unknown field), `empty re
 
 `LlamaError` (typed via `thiserror`) implements `Clone` for use across channel boundaries:
 
-| Variant | Meaning |
-|---|---|
-| `ModelLoad(String)` | Model failed to load, or the llama.cpp backend failed to initialize |
-| `InferenceCrashed` | Inference thread died, or the engine was shut down mid-request |
-| `Inference(String)` | Runtime failure (batch overflow, chat template application, prompt-over-budget rejection, streaming disconnect, detokenization) |
-| `Protocol(String)` | Message construction: null-byte / invalid role-or-content rejection (`NewLlamaChatMessageError`) |
-| `Io(std::io::Error)` | Thread spawn or I/O failure |
+| Variant | Meaning | Caller's move |
+|---|---|---|
+| `ModelLoad(String)` | Model failed to load, or the llama.cpp backend failed to initialize | Fix the path or the environment |
+| `InferenceCrashed` | Inference thread died, or the engine was shut down mid-request | Rebuild the engine |
+| `Busy` | Every slot was occupied when the request arrived | **Retry** — transient |
+| `PromptTooLong { tokens, budget }` | The templated prompt alone exhausts the per-slot budget | Shorten the prompt, or raise `LLAMAD_N_CTX` / lower `LLAMAD_N_SLOTS`. Retrying is pointless |
+| `Disconnected` | The streaming client hung up, cancelling generation | Expected when a `TokenStream` is dropped early — that *is* how cancellation is requested |
+| `Inference(String)` | Runtime failure with no specific caller response: batch overflow, chat template application, detokenization | Treat as a bug or a resource limit |
+| `Protocol(String)` | Message construction: null-byte / invalid role-or-content rejection (`NewLlamaChatMessageError`), or a grammar that does not compile | Fix the request |
+| `Io(std::io::Error)` | Thread spawn or I/O failure | Depends on the `ErrorKind` |
+
+`Busy`, `PromptTooLong` and `Disconnected` are split out of the `Inference`
+catch-all precisely because they imply different responses — the first is worth
+retrying, the second never is, and the third is usually self-inflicted and
+benign. Matching on the message string is never necessary.
 
 `LlamaError` is `#[non_exhaustive]`; match with a `_` arm.
 

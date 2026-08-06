@@ -603,12 +603,7 @@ fn fill_empty_slot(
         Some(i) => i,
         None => {
             tracing::warn!("All slots full, dropping request");
-            reject(
-                LlamaError::Inference("all slots busy, try again later".into()),
-                resp,
-                token_tx,
-                done_tx,
-            );
+            reject(LlamaError::Busy, resp, token_tx, done_tx);
             return;
         }
     };
@@ -1095,9 +1090,7 @@ fn inference_loop(
                         continue;
                     }
                     Emit::Disconnected => {
-                        slot.cancel(LlamaError::Inference(
-                            "streaming client disconnected".into(),
-                        ));
+                        slot.cancel(LlamaError::Disconnected);
                         slot_cache[seq_id].clear();
                         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
                         continue;

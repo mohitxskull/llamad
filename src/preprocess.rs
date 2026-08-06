@@ -144,10 +144,10 @@ pub(crate) fn compute_max_gen(
     let max_tokens = max_tokens.unwrap_or(256);
     let max_gen = max_tokens.min(per_slot_budget.saturating_sub(n_prompt as u32));
     if max_gen == 0 {
-        return Err(LlamaError::Inference(format!(
-            "prompt too long ({} tokens, max {per_slot_budget} per slot)",
-            n_prompt
-        )));
+        return Err(LlamaError::PromptTooLong {
+            tokens: n_prompt,
+            budget: per_slot_budget,
+        });
     }
     Ok(max_gen)
 }
@@ -282,9 +282,16 @@ mod tests {
 
     #[test]
     fn test_compute_max_gen_prompt_too_long() {
+        // A dedicated variant, not the `Inference` catch-all: this is
+        // permanent for the request, and a caller that retries it wastes work.
         let err = compute_max_gen(512, Some(10), 512).unwrap_err();
-        assert!(err.to_string().contains("prompt too long"));
-        assert!(err.to_string().contains("512"));
+        assert!(matches!(
+            err,
+            LlamaError::PromptTooLong {
+                tokens: 512,
+                budget: 512
+            }
+        ));
     }
 
     #[test]
@@ -293,9 +300,18 @@ mod tests {
         // (a plain `-` would underflow), surfacing the specific error with
         // both token counts.
         let err = compute_max_gen(600, Some(10), 512).unwrap_err();
-        assert!(err.to_string().contains("prompt too long"));
-        assert!(err.to_string().contains("600"));
-        assert!(err.to_string().contains("512"));
+        assert!(matches!(
+            err,
+            LlamaError::PromptTooLong {
+                tokens: 600,
+                budget: 512
+            }
+        ));
+        // Both counts must survive into the message a human reads.
+        assert_eq!(
+            err.to_string(),
+            "prompt too long (600 tokens, max 512 per slot)"
+        );
     }
 
     #[test]

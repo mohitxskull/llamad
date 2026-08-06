@@ -24,10 +24,42 @@ pub enum LlamaError {
     #[error("inference thread crashed")]
     InferenceCrashed,
     /// A runtime failure during generation: batch overflow, chat-template
-    /// application, a prompt over the per-slot budget, a disconnected
-    /// streaming client, or detokenization.
+    /// application, or detokenization.
+    ///
+    /// This is the catch-all for failures the caller cannot act on
+    /// programmatically. Conditions that *do* imply a specific caller
+    /// response have their own variants: [`Busy`](Self::Busy),
+    /// [`PromptTooLong`](Self::PromptTooLong) and
+    /// [`Disconnected`](Self::Disconnected).
     #[error("inference failed: {0}")]
     Inference(String),
+    /// Every slot was occupied when the request arrived.
+    ///
+    /// Transient backpressure, not a fault in the request: the same request
+    /// will succeed once a slot frees. Retry it.
+    #[error("all slots busy")]
+    Busy,
+    /// The templated prompt alone exhausts the per-slot token budget, leaving
+    /// no room to generate.
+    ///
+    /// Permanent for this request/configuration pair: retrying is pointless.
+    /// Shorten the prompt, or raise `LLAMAD_N_CTX` (or lower `LLAMAD_N_SLOTS`,
+    /// which the budget is divided by).
+    #[error("prompt too long ({tokens} tokens, max {budget} per slot)")]
+    PromptTooLong {
+        /// Tokens in the templated prompt.
+        tokens: usize,
+        /// The per-slot budget the prompt exceeded.
+        budget: u32,
+    },
+    /// The streaming client hung up, so generation was cancelled.
+    ///
+    /// Expected whenever a [`TokenStream`](crate::client::TokenStream) is
+    /// dropped early — that is how cancellation is requested — so this is
+    /// normally observed only by the daemon's logs, not by the caller who
+    /// caused it.
+    #[error("streaming client disconnected")]
+    Disconnected,
     /// Message construction rejected the input — a null byte or an otherwise
     /// invalid role/content pair.
     #[error("protocol error: {0}")]
@@ -43,6 +75,12 @@ impl Clone for LlamaError {
             LlamaError::ModelLoad(s) => LlamaError::ModelLoad(s.clone()),
             LlamaError::InferenceCrashed => LlamaError::InferenceCrashed,
             LlamaError::Inference(s) => LlamaError::Inference(s.clone()),
+            LlamaError::Busy => LlamaError::Busy,
+            LlamaError::PromptTooLong { tokens, budget } => LlamaError::PromptTooLong {
+                tokens: *tokens,
+                budget: *budget,
+            },
+            LlamaError::Disconnected => LlamaError::Disconnected,
             LlamaError::Protocol(s) => LlamaError::Protocol(s.clone()),
             LlamaError::Io(e) => LlamaError::Io(std::io::Error::new(e.kind(), e.to_string())),
         }

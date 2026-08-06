@@ -106,10 +106,23 @@ fn per_engine_config_is_clamped_not_trusted() {
         },
     )
     .expect("client with a degenerate config");
-    // n_ctx clamps up to n_slots (1), leaving a 1-token budget — too small for
-    // any prompt, so this must be a clean error rather than a crash.
-    let err = client.complete(short("Hi")).expect_err("budget is 1 token");
-    assert!(matches!(err, LlamaError::Inference(_)), "got {err:?}");
+    // n_ctx clamps up to the larger of n_slots (1) and the batch-assert floor
+    // MIN_N_CTX (2), so the budget is 2 tokens — too small for any templated
+    // prompt, so this must be a clean error rather than a crash. The specific
+    // variant matters: `PromptTooLong` tells the caller the request is
+    // permanently unservable at this configuration, where the `Inference`
+    // catch-all would leave "retry?" ambiguous.
+    let err = client
+        .complete(short("Hi"))
+        .expect_err("budget is 2 tokens");
+    let LlamaError::PromptTooLong { tokens, budget } = err else {
+        panic!("expected PromptTooLong, got {err:?}");
+    };
+    assert_eq!(budget, 2, "MIN_N_CTX floor binds above n_slots");
+    assert!(
+        tokens > budget as usize,
+        "the templated prompt ({tokens}) must exceed the budget ({budget})"
+    );
 }
 
 #[serial]
