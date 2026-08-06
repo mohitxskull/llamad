@@ -3,8 +3,11 @@
 //! Usage:
 //!   cargo run --release -p llamad --example bench -- <model.gguf> <n_repeat> [system_prompt]
 //!
-//! Prints one JSON line per run: {"run":N,"prompt_tokens":P,"generated_tokens":G,
-//! "ttft_ms":T,"decode_ms":D,"decode_tok_per_s":S}
+//! Prints one line per run: run=N prompt_tokens=P generated_tokens=G
+//! ttft_ms=T decode_ms=D decode_tok_per_s=S
+//!
+//! `decode_tok_per_s` is steady-state throughput: it excludes the first token,
+//! which is produced during the TTFT window rather than the decode window.
 //! Then prints "SUMMARY <name>=<value>" lines for the report.
 
 use std::time::Instant;
@@ -46,6 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(_t) = stream.next_token() {}
         let decode_ms = decode_started.elapsed().as_millis();
         let result = stream.into_result()?;
+        // The first token was produced during the TTFT window, not the decode
+        // window, so it must not be counted against `decode_ms`. Including it
+        // overstates throughput by roughly 1/N — small at N=200, but these
+        // numbers are quoted in the README.
+        let decoded_tokens = result.generated_tokens.saturating_sub(1);
         println!(
             "RUN run={} prompt_tokens={} generated_tokens={} ttft_ms={} decode_ms={} decode_tok_per_s={}",
             run,
@@ -53,14 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             result.generated_tokens,
             ttft_ms,
             decode_ms,
-            decode_tok_per_s(decode_ms, result.generated_tokens)
+            decode_tok_per_s(decode_ms, decoded_tokens)
         );
-        runs.push((
-            ttft_ms,
-            result.prompt_tokens,
-            result.generated_tokens,
-            decode_ms,
-        ));
+        runs.push((ttft_ms, result.prompt_tokens, decoded_tokens, decode_ms));
     }
 
     let n = runs.len() as u64;
@@ -76,9 +79,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn decode_tok_per_s(decode_ms: u128, generated_tokens: usize) -> f32 {
+/// Steady-state decode rate: tokens produced *within* the decode window over
+/// that window. The first token belongs to TTFT, so callers pass
+/// `generated_tokens - 1`.
+fn decode_tok_per_s(decode_ms: u128, decoded_tokens: usize) -> f32 {
     if decode_ms == 0 {
         return 0.0;
     }
-    generated_tokens as f32 / (decode_ms as f32 / 1000.0)
+    decoded_tokens as f32 / (decode_ms as f32 / 1000.0)
 }
