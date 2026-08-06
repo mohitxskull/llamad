@@ -117,7 +117,38 @@ MIN_AVAIL_MB=2500
 LOW_STREAK_LIMIT=3
 MEM_TRACE="${TMPDIR}/memory-trace.log"
 
-cargo mutants "$@" &
+# ── Contain memory-bomb mutants ──────────────────────────────────────────────
+#
+# This is the actual reason three runs died at mutant 18 of 273, after tmpfs,
+# disk and build parallelism had each been blamed and fixed in turn:
+#
+#     TokenStream::next_token -> Option<String> with Some(String::new())
+#
+# A `next_token` that always returns `Some` makes every
+# `while let Some(t) = stream.next_token()` loop in the suite run forever,
+# allocating each iteration. The memory trace is a straight line — ~1.7 GB
+# every 3 seconds — and cargo-mutants' 30s test timeout never gets a chance,
+# because RAM is gone in twenty.
+#
+# That mutant is not a defect in llamad; an infinite loop is a perfectly good
+# thing for a mutation tester to try. It just has to be survivable. A cgroup
+# with a hard cap makes it so: the runaway test binary is killed by the kernel
+# inside its own scope, cargo-mutants records the mutant and moves on, and the
+# machine never notices.
+#
+# 8G leaves ample room for a real build and link while killing a runaway in
+# seconds. Falls back to running uncapped if systemd is unavailable — with a
+# warning, because that is the configuration that freezes machines.
+MEMORY_MAX=8G
+if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope -q true 2>/dev/null; then
+    systemd-run --user --scope -q -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0 \
+        cargo mutants "$@" &
+else
+    echo "warning: systemd-run unavailable — running without a memory cap." >&2
+    echo "         A mutant that loops forever while allocating can take the" >&2
+    echo "         machine down. The watchdog below is the only guard." >&2
+    cargo mutants "$@" &
+fi
 mutants_pid=$!
 
 watchdog() {
