@@ -35,9 +35,43 @@ if [ "${avail_gb:-0}" -lt 15 ]; then
     exit 1
 fi
 
-echo "scratch dir : $TMPDIR ($(df -h --output=fstype "$TMPDIR" | tail -1 | tr -d ' '), ${avail_gb}G free)"
-echo "test command: cargo test --lib   (see .cargo/mutants.toml)"
-echo
+
+# ── Build in place ───────────────────────────────────────────────────────────
+#
+# Measured, after three wrong theories about what was eating memory:
+#
+#   copied tree : 567s baseline, memory pressure enough to trip the watchdog
+#   --in-place  : 20 mutants in 63s, build processes peaking at 316 MB RSS
+#
+# The cost was never cargo-mutants itself. It was the *separate build tree*:
+# copying the crate and recompiling llama.cpp from source, with debuginfo, on
+# every run. In place, the already-built target/ is reused and the whole
+# problem disappears.
+#
+# The tradeoff is that mutants are written into the real source files. That is
+# safe here because the tree must be clean to start and is restored on exit —
+# both enforced below — but it is why this is a script and not a bare flag in
+# a config file.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "error: working tree is dirty." >&2
+    echo "       --in-place writes mutants into your source files; refusing to" >&2
+    echo "       start when uncommitted work could be confused with a mutant." >&2
+    exit 1
+fi
+
+restore() {
+    if ! git diff --quiet; then
+        echo >&2
+        echo "restoring source files mutated in place..." >&2
+        git checkout -- src/ 2>/dev/null || true
+    fi
+}
+trap restore EXIT INT TERM
+
+case " $* " in
+    *" --in-place "*) ;;                 # caller already asked
+    *) set -- --in-place "$@" ;;
+esac
 
 # ── Build parallelism ────────────────────────────────────────────────────────
 #
@@ -60,7 +94,9 @@ done
 if [ -n "$inject_tasks" ]; then
     set -- --jobserver-tasks 1 "$@"
 fi
-echo "parallelism : $(for a in "$@"; do :; done; echo "$*" | grep -o -- '--jobserver-tasks[= ][0-9]*' || echo default)"
+echo "mode        : in-place (reuses target/, restored on exit)"
+echo "test command: cargo test --lib   (see .cargo/mutants.toml)"
+echo "scratch dir : $TMPDIR (${avail_gb}G free) — off tmpfs"
 echo
 
 # ── Memory watchdog ──────────────────────────────────────────────────────────

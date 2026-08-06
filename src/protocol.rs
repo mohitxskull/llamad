@@ -664,6 +664,68 @@ mod tests {
     }
 
     #[test]
+    fn test_every_builder_sets_its_field() {
+        // Mutation testing found `with_grammar`, `with_grammar_root`,
+        // `with_stop` and `push_stop` unasserted by the unit suite. They are
+        // exercised by `tests/integration.rs`, so a builder that silently
+        // returned `Default::default()` — dropping the prompt along with
+        // everything else — would have been caught, but only by the slow suite
+        // that needs a GGUF on disk. This is the same contract at unit speed.
+        //
+        // Every builder in one test on purpose: the failure mode is a whole
+        // method quietly doing nothing, and a per-method test invites adding a
+        // builder without adding its assertion.
+        let req = Request::new("prompt")
+            .with_system("sys")
+            .with_max_tokens(50)
+            .with_temperature(0.7)
+            .with_top_k(7)
+            .with_top_p(0.3)
+            .with_repeat_penalty(1.5)
+            .with_repeat_last_n(64)
+            .with_seed(9)
+            .with_grammar("root ::= \"a\"")
+            .with_grammar_root("start")
+            .with_stop(vec!["END".to_owned()])
+            .push_stop("STOP")
+            .with_stream(true)
+            .with_history(vec![HistoryMessage {
+                role: "user".into(),
+                content: "earlier".into(),
+            }])
+            .push_history("assistant", "reply");
+
+        assert_eq!(req.prompt, "prompt");
+        assert_eq!(req.system.as_deref(), Some("sys"));
+        assert_eq!(req.max_tokens, Some(50));
+        assert_eq!(req.temperature, Some(0.7));
+        assert_eq!(req.top_k, Some(7));
+        assert_eq!(req.top_p, Some(0.3));
+        assert_eq!(req.repeat_penalty, Some(1.5));
+        assert_eq!(req.repeat_last_n, Some(64));
+        assert_eq!(req.seed, Some(9));
+        assert_eq!(req.grammar.as_deref(), Some("root ::= \"a\""));
+        assert_eq!(req.grammar_root.as_deref(), Some("start"));
+        assert_eq!(req.stop, vec!["END".to_owned(), "STOP".to_owned()]);
+        assert_eq!(req.stream, Some(true));
+        assert_eq!(req.history.len(), 2);
+        assert_eq!(req.history[1].role, "assistant");
+    }
+
+    #[test]
+    fn test_with_stop_replaces_and_push_stop_appends() {
+        // The two differ, and a builder that confused them would still pass a
+        // test that only checked the final list was non-empty.
+        let replaced = Request::new("p")
+            .push_stop("first")
+            .with_stop(vec!["only".to_owned()]);
+        assert_eq!(replaced.stop, vec!["only".to_owned()]);
+
+        let appended = Request::new("p").push_stop("a").push_stop("b");
+        assert_eq!(appended.stop, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
     fn test_error_response_round_trips() {
         let err = ErrorResponse {
             error: "boom".into(),
