@@ -28,7 +28,7 @@ use llamad::protocol::Request;
 use serial_test::serial;
 
 mod common;
-use common::{captured_lines, install_capture_layer, reuse_model_path};
+use common::{captured_lines, install_capture_layer, model_attention};
 
 fn req(text: &str) -> Request {
     Request::new(text).with_temperature(0.0).with_max_tokens(20)
@@ -42,7 +42,7 @@ fn identical_prompt_twice_succeeds() {
     // retained cache (lcp == n_prompt), so the zero-token prefill anchor and
     // the C1 rewind ([n_prompt-1, ∞) clear) run. A mirror-corruption or
     // anchor-regression bug would fail the equality assertion loudly.
-    let Some(model) = reuse_model_path() else {
+    let Some(model) = model_attention() else {
         skip_without_reuse_model();
         return;
     };
@@ -92,7 +92,7 @@ fn partial_prefix_triple_keeps_outputs_consistent() {
     // real prefix, so the mirror + fill-time KV reconciliation (partial clear
     // [lcp, ∞) + fallback) ARE exercised — a mirror-corruption or
     // under-clear bug would silently diverge, caught here.
-    let Some(model) = reuse_model_path() else {
+    let Some(model) = model_attention() else {
         skip_without_reuse_model();
         return;
     };
@@ -146,7 +146,7 @@ fn reuse_engages_on_rewind_capable_model() {
     // during the second fill and `complete` returns only after the request is
     // served — a single assert reads settled state (happens-before via the
     // response channel; no polling needed).
-    let Some(model) = reuse_model_path() else {
+    let Some(model) = model_attention() else {
         skip_without_reuse_model();
         return;
     };

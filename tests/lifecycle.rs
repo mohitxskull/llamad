@@ -22,7 +22,7 @@ use llamad::protocol::{InferCmd, LlamaError, Request};
 use serial_test::serial;
 
 mod common;
-use common::{model_1_2b, model_230m};
+use common::{model_hybrid, model_hybrid_large};
 
 fn short(text: &str) -> Request {
     Request::new(text).with_max_tokens(8)
@@ -53,7 +53,7 @@ fn two_models_run_side_by_side_with_independent_configs() {
     // sizable. Thread counts are deliberately under physical cores here —
     // two engines each defaulting to all cores oversubscribe ggml's workers.
     let router = Client::with_config(
-        model_230m(),
+        model_hybrid(),
         InferenceConfig {
             n_ctx: 512,
             n_threads: 1,
@@ -63,7 +63,7 @@ fn two_models_run_side_by_side_with_independent_configs() {
     )
     .expect("router client");
     let thinker = Client::with_config(
-        model_1_2b(),
+        model_hybrid_large(),
         InferenceConfig {
             n_ctx: 1024,
             n_threads: 2,
@@ -96,7 +96,7 @@ fn per_engine_config_is_clamped_not_trusted() {
     // `n_slots: 0`, which would divide by zero when the per-slot budget is
     // computed. The engine must clamp rather than panic.
     let client = Client::with_config(
-        model_230m(),
+        model_hybrid(),
         InferenceConfig {
             n_slots: 0,
             n_ctx: 0,
@@ -130,9 +130,9 @@ fn per_engine_config_is_clamped_not_trusted() {
 fn two_clients_can_be_alive_at_once() {
     // Regression: a global join made this deadlock. The second constructor
     // never returned while the first client was alive.
-    let first = Client::new(model_230m()).expect("first client");
+    let first = Client::new(model_hybrid()).expect("first client");
     within(Duration::from_secs(60), "second Client::new", || {
-        let second = Client::new(model_230m()).expect("second client");
+        let second = Client::new(model_hybrid()).expect("second client");
         let result = second.complete(short("Hi")).expect("second completion");
         assert!(!result.text.is_empty());
     });
@@ -160,7 +160,7 @@ fn engines_starting_simultaneously_all_survive_backend_init() {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                let client = Client::new(model_230m()).expect("client");
+                let client = Client::new(model_hybrid()).expect("client");
                 client
                     .complete(short("Hi"))
                     .unwrap_or_else(|e| panic!("client {i} failed: {e}"))
@@ -181,7 +181,7 @@ fn dropping_an_engine_joins_promptly_while_a_slot_is_busy() {
     // be seen until the in-flight request exhausted its generation budget.
     // SAFETY: this test is `#[serial]` and no other thread reads these vars.
     unsafe { std::env::set_var("LLAMAD_N_SLOTS", "1") };
-    let engine = Engine::start(model_230m()).expect("start engine");
+    let engine = Engine::start(model_hybrid()).expect("start engine");
 
     let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
     engine
@@ -213,7 +213,7 @@ fn dropping_an_engine_joins_promptly_while_a_slot_is_busy() {
 #[serial]
 #[test]
 fn engine_shutdown_is_explicit_and_idempotent_with_drop() {
-    let engine = Engine::start(model_230m()).expect("start engine");
+    let engine = Engine::start(model_hybrid()).expect("start engine");
     within(Duration::from_secs(60), "Engine::shutdown", move || {
         engine.shutdown();
     });
@@ -224,7 +224,7 @@ fn engine_shutdown_is_explicit_and_idempotent_with_drop() {
 async fn async_api_works_inside_a_tokio_runtime() {
     // The blocking API panics here by tokio's design; these are the methods
     // async callers are told to use, so they must be exercised in a runtime.
-    let client = Client::new(model_230m()).expect("load model");
+    let client = Client::new(model_hybrid()).expect("load model");
 
     let result = client
         .complete_async(short("Hi"))

@@ -9,10 +9,8 @@ use llamad::inference::start_inference;
 use llamad::protocol::{InferCmd, Request};
 use serial_test::serial;
 
-const MODEL_230M: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/models/LFM2.5-230M-Q4_K_M.gguf"
-);
+mod common;
+use common::model_hybrid;
 
 #[serial]
 #[test]
@@ -23,7 +21,7 @@ fn drop_token_stream_cancels_inference() {
     // SAFETY: this is the only test in this binary; no other thread reads
     // or writes these env vars.
     unsafe { std::env::set_var("LLAMAD_N_SLOTS", "1") };
-    let engine = start_inference(MODEL_230M).expect("start inference thread");
+    let engine = start_inference(model_hybrid()).expect("start inference thread");
 
     // First request: a long generation. Receive one token to confirm it is
     // mid-flight, then drop the receiver — the inference thread's next emit

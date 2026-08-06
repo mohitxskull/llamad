@@ -22,53 +22,140 @@
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-/// Model paths default to the crate's `models/` dir; every constant can be
-/// overridden via env (`LLAMAD_TEST_MODEL_230M`, `LLAMAD_TEST_MODEL_1_2B`,
-/// `LLAMAD_TEST_MODEL`) so the suite runs on any machine without editing code.
-pub fn env_override(key: &str, default: &'static str) -> String {
-    std::env::var(key)
+// ── Model fixtures ──────────────────────────────────────────────────────────
+
+/// One GGUF fixture, named for the **capability** a test needs from it rather
+/// than for its size or vendor.
+///
+/// The distinction is load-bearing, not cosmetic. `probe_kv_rewind` decides at
+/// startup whether a model supports partial KV rewind, and that verdict is the
+/// thing several tests assert on: the reuse tests need a model where the probe
+/// says *yes*, the degrade tests need one where it says *no*. Naming these
+/// `model_230m` / `model_1_2b` invited pointing an override at a model with
+/// the opposite property, which made the test fail for a reason its name did
+/// not explain.
+pub struct Fixture {
+    /// Filename under `models/`. Must match a key in `models/download.sh` —
+    /// `tests/fixtures.rs` fails if these two drift apart.
+    pub file: &'static str,
+    /// Environment variable that overrides the path to this fixture.
+    pub env: &'static str,
+    /// What a test gets from this model, for the message printed when it is
+    /// missing.
+    pub capability: &'static str,
+}
+
+/// Hybrid/SSM architecture: the startup probe refuses partial KV rewind, so
+/// prefix reuse degrades to a full prefill. The default workhorse — small and
+/// fast, and the model the degrade-path contracts are written against.
+pub const HYBRID: Fixture = Fixture {
+    file: "LFM2.5-230M-Q4_K_M.gguf",
+    env: "LLAMAD_TEST_MODEL_HYBRID",
+    capability: "hybrid/SSM arch (KV rewind unsupported — degraded path)",
+};
+
+/// A second, larger hybrid model. Only used to prove a bigger model loads and
+/// generates; nothing depends on its size beyond that.
+pub const HYBRID_LARGE: Fixture = Fixture {
+    file: "LFM2.5-1.2B-Thinking-Q4_K_M.gguf",
+    env: "LLAMAD_TEST_MODEL_HYBRID_LARGE",
+    capability: "a larger hybrid model",
+};
+
+/// Pure-attention architecture: the probe accepts partial KV rewind, so the
+/// prefix-reuse path actually engages. Without this the reuse assertions in
+/// `tests/reuse.rs` are vacuous.
+pub const ATTENTION: Fixture = Fixture {
+    file: "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    env: "LLAMAD_TEST_MODEL_ATTENTION",
+    capability: "pure-attention arch (KV rewind supported — reuse engages)",
+};
+
+/// Every fixture the suite knows about. `tests/fixtures.rs` checks this list
+/// against `models/download.sh` in both directions, so a renamed quant and an
+/// orphaned download are both caught.
+pub const ALL: &[&Fixture] = &[&HYBRID, &HYBRID_LARGE, &ATTENTION];
+
+/// Set by CI. When present, a missing fixture is a test failure rather than a
+/// skip — otherwise a suite that silently tested nothing reports as green.
+pub const REQUIRE_ENV: &str = "LLAMAD_REQUIRE_MODELS";
+
+fn require_models() -> bool {
+    std::env::var(REQUIRE_ENV)
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+        .is_some_and(|v| !v.trim().is_empty() && v.trim() != "0")
 }
 
-pub const MODEL_230M: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/models/LFM2.5-230M-Q4_K_M.gguf"
-);
-pub const MODEL_1_2B: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/models/LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
-);
-
-/// LFM2.5-230M path (hybrid arch — KV reuse degrades by probe verdict),
-/// overridable via `LLAMAD_TEST_MODEL_230M`.
-pub fn model_230m() -> String {
-    env_override("LLAMAD_TEST_MODEL_230M", MODEL_230M)
-}
-
-/// LFM2.5-1.2B-Thinking path, overridable via `LLAMAD_TEST_MODEL_1_2B`.
-pub fn model_1_2b() -> String {
-    env_override("LLAMAD_TEST_MODEL_1_2B", MODEL_1_2B)
-}
-
-/// Optional rewind-capable (pure-attention) GGUF: `LLAMAD_TEST_MODEL` when
-/// set, else the bundled SmolLM2-135M in `models/` when present. With a
-/// rewind-capable model the probe returns true and the KV-reuse path actually
-/// engages; without one, the reuse tests in `tests/reuse.rs` skip with a
-/// message. All four models are fetched by `models/download.sh`.
-pub fn reuse_model_path() -> Option<String> {
-    if let Some(p) = std::env::var("LLAMAD_TEST_MODEL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return Some(p);
+impl Fixture {
+    /// Path to this fixture: the override if set, else `models/<file>`.
+    /// Does not check that anything exists there.
+    pub fn path(&self) -> String {
+        std::env::var(self.env)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{}/models/{}", env!("CARGO_MANIFEST_DIR"), self.file))
     }
-    let bundled = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/models/SmolLM2-135M-Instruct-Q4_K_M.gguf"
-    );
-    std::fs::metadata(bundled).ok().map(|_| bundled.to_string())
+
+    /// Whether the fixture is actually on disk.
+    pub fn available(&self) -> bool {
+        std::fs::metadata(self.path()).is_ok()
+    }
+
+    /// Path to a fixture the test cannot run without.
+    ///
+    /// Panics with an actionable message rather than letting the model load
+    /// fail later as a generic `InferenceCrashed`, which says nothing about
+    /// what is missing or how to get it.
+    pub fn require(&self) -> String {
+        let path = self.path();
+        assert!(
+            self.available(),
+            "missing fixture {} ({})\n  expected at: {path}\n  fix: run ./models/download.sh, or set {}=/path/to/model.gguf",
+            self.file,
+            self.capability,
+            self.env
+        );
+        path
+    }
+
+    /// Path to a fixture the test can be skipped without — unless
+    /// [`REQUIRE_ENV`] is set, where a missing fixture fails instead.
+    ///
+    /// Returns `None` to mean "skip". The caller must still return early; a
+    /// skipped test reports as a pass, which is exactly why CI sets
+    /// [`REQUIRE_ENV`].
+    pub fn optional(&self) -> Option<String> {
+        if self.available() {
+            return Some(self.path());
+        }
+        assert!(
+            !require_models(),
+            "{REQUIRE_ENV} is set, so fixture {} ({}) must be present.\n  expected at: {}\n  fix: run ./models/download.sh",
+            self.file,
+            self.capability,
+            self.path()
+        );
+        eprintln!(
+            "SKIPPED: no {} available ({}). Run ./models/download.sh or set {}.",
+            self.file, self.capability, self.env
+        );
+        None
+    }
+}
+
+/// Hybrid model, required.
+pub fn model_hybrid() -> String {
+    HYBRID.require()
+}
+
+/// Larger hybrid model, required.
+pub fn model_hybrid_large() -> String {
+    HYBRID_LARGE.require()
+}
+
+/// Pure-attention model, or `None` to skip.
+pub fn model_attention() -> Option<String> {
+    ATTENTION.optional()
 }
 
 // ── Global tracing capture layer ────────────────────────────────────────────

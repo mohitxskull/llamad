@@ -7,7 +7,7 @@
 #
 # Re-running is safe: a file already present at the server's current
 # Content-Length is kept; interrupted downloads resume via `curl -C -`.
-# Requires curl or wget. ~730 MB total (LFM2.5-1.2B is the big one).
+# Requires curl or wget. ~950 MB total (LFM2.5-1.2B is ~730 MB of it).
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -16,7 +16,6 @@ declare -A MODELS=(
   ["LFM2.5-230M-Q4_K_M.gguf"]="https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_K_M.gguf"
   ["LFM2.5-1.2B-Thinking-Q4_K_M.gguf"]="https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking-GGUF/resolve/main/LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
   ["SmolLM2-135M-Instruct-Q4_K_M.gguf"]="https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
-  ["qwen2.5-0.5b-instruct-q4_k_m.gguf"]="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 )
 
 if command -v curl >/dev/null 2>&1; then

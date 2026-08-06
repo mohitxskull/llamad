@@ -7,7 +7,9 @@ use llamad::protocol::{InferCmd, InferResult, LlamaError, Request};
 use serial_test::serial;
 
 mod common;
-use common::{captured_lines, install_capture_layer, model_1_2b, model_230m, reuse_model_path};
+use common::{
+    captured_lines, install_capture_layer, model_attention, model_hybrid, model_hybrid_large,
+};
 
 fn short_req(text: &str) -> Request {
     Request::new(text).with_max_tokens(10)
@@ -43,7 +45,7 @@ fn oneshot_bridge<T: Send + 'static>(rx: tokio::sync::oneshot::Receiver<T>) -> m
 #[serial]
 #[test]
 fn client_completes_non_streaming() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let result = client.complete(short_req("Hi")).expect("completion");
     assert!(!result.text.is_empty(), "should generate text");
     assert!(result.prompt_tokens > 0, "should count prompt tokens");
@@ -66,7 +68,7 @@ fn client_completes_non_streaming() {
 #[serial]
 #[test]
 fn client_completes_streaming() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let mut stream = client
         .complete_stream(short_req("Hi"))
         .expect("start stream");
@@ -86,7 +88,7 @@ fn client_completes_streaming() {
 #[serial]
 #[test]
 fn client_stream_into_result_returns_stats() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let stream = client
         .complete_stream(short_req("Hi"))
         .expect("start stream");
@@ -105,7 +107,7 @@ fn client_stream_into_result_returns_stats() {
 #[serial]
 #[test]
 fn client_completes_with_system_prompt() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let req = Request::new("what is 1+1?")
         .with_system("answer in one word")
         .with_max_tokens(20);
@@ -121,7 +123,7 @@ fn client_completes_with_system_prompt() {
 #[serial]
 #[test]
 fn client_completes_with_temperature() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let req = Request::new("hello")
         .with_temperature(0.8)
         .with_max_tokens(20);
@@ -150,7 +152,7 @@ fn client_model_load_failure_surfaces_as_crash() {
 #[test]
 fn batch_overflow_queues_fifth() {
     let engine = with_n_slots("4", || {
-        start_inference(model_230m()).expect("start inference thread")
+        start_inference(model_hybrid()).expect("start inference thread")
     });
 
     let mut bridges: Vec<mpsc::Receiver<Result<InferResult, LlamaError>>> = Vec::new();
@@ -188,7 +190,7 @@ fn batch_overflow_queues_fifth() {
 #[test]
 fn batch_overflow_streaming_queues_fifth() {
     let engine = with_n_slots("4", || {
-        start_inference(model_230m()).expect("start inference thread")
+        start_inference(model_hybrid()).expect("start inference thread")
     });
 
     let mut bridges: Vec<mpsc::Receiver<Result<InferResult, LlamaError>>> = Vec::new();
@@ -236,7 +238,7 @@ fn stop_sequence_truncates_the_completion() {
     // marker lifted out of an unconstrained run is guaranteed to appear in a
     // second run of the same prompt. That sidesteps guessing what a 230M model
     // will say while still exercising the real generation loop.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let base = Request::new("Count from one to ten.")
         .with_temperature(0.0)
         .with_max_tokens(40);
@@ -284,7 +286,7 @@ fn stop_sequence_truncates_the_completion() {
 fn stop_sequence_truncates_a_streamed_completion() {
     // The streamed bytes must agree with the final result: no fragment of the
     // stop sequence may leak to the client before the match resolves.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let base = Request::new("Count from one to ten.")
         .with_temperature(0.0)
         .with_max_tokens(40);
@@ -327,7 +329,7 @@ const CHOICE_GRAMMAR: &str = r#"root ::= [ \n]* ("yes" | "no" | "maybe")"#;
 fn grammar_constrains_output_to_the_grammar() {
     // The point of grammar support: a 230M model asked an open question will
     // ramble, but under a constraint the output *cannot* be anything else.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let result = client
         .complete(
             Request::new("Is the sky blue? Answer in one word.")
@@ -349,7 +351,7 @@ fn grammar_applies_under_greedy_decoding() {
     // Greedy decoding replaces the whole sampler chain, so the grammar has to
     // be spliced in ahead of the greedy tail rather than dropped. A regression
     // here would silently produce unconstrained output at temperature 0.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let result = client
         .complete(
             Request::new("Is the sky blue? Answer in one word.")
@@ -376,7 +378,7 @@ root   ::= "{" ws "\"ok\"" ws ":" ws bool ws "}"
 bool   ::= "true" | "false"
 ws     ::= " "?
 "#;
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let result = client
         .complete(
             Request::new("Reply with a JSON object having key ok.")
@@ -401,7 +403,7 @@ fn invalid_grammar_is_rejected_without_killing_the_engine() {
     // (llama.cpp returns null, the binding unwraps it). Grammars arrive over
     // the socket, so an unguarded panic would be a remote kill of the whole
     // engine. The bad request must fail alone and the engine keep serving.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
 
     let err = client
         .complete(Request::new("hi").with_grammar("root ::= ((( unterminated"))
@@ -423,7 +425,7 @@ fn invalid_grammar_is_rejected_without_killing_the_engine() {
 fn grammar_with_a_null_byte_is_rejected() {
     // The other panic path in the binding: `CString::new` on a string with an
     // interior null byte.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let err = client
         .complete(Request::new("hi").with_grammar("root ::= \"a\"\0"))
         .expect_err("a null byte must be rejected");
@@ -433,7 +435,7 @@ fn grammar_with_a_null_byte_is_rejected() {
 #[serial]
 #[test]
 fn unknown_grammar_root_is_rejected() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let err = client
         .complete(
             Request::new("hi")
@@ -454,7 +456,7 @@ fn identical_requests_vary_without_an_explicit_seed() {
     // observable effect across requests. Three samples at temperature 1.0 over
     // 40 tokens of a 65K vocabulary — all three matching would mean the seed
     // is pinned, not that sampling got lucky.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let req = Request::new("Invent a short unusual sentence.")
         .with_temperature(1.0)
         .with_max_tokens(40);
@@ -474,7 +476,7 @@ fn identical_requests_vary_without_an_explicit_seed() {
 fn an_explicit_seed_reproduces_the_same_text() {
     // The other half of the contract: opting into a seed must give back
     // reproducibility, which is what makes the random default safe to ship.
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let req = Request::new("Invent a short unusual sentence.")
         .with_temperature(1.0)
         .with_max_tokens(40)
@@ -490,7 +492,7 @@ fn an_explicit_seed_reproduces_the_same_text() {
 #[serial]
 #[test]
 fn four_consecutive_completions_recycle_slots() {
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     for i in 0..4 {
         let result = client
             .complete(short_req(&format!("request {i}")))
@@ -503,8 +505,8 @@ fn four_consecutive_completions_recycle_slots() {
 
 #[serial]
 #[test]
-fn model_1_2b_completes() {
-    let client = Client::new(model_1_2b()).expect("load 1.2B model");
+fn large_hybrid_model_completes() {
+    let client = Client::new(model_hybrid_large()).expect("load large hybrid model");
     let result = client
         .complete(Request::new("Hello").with_max_tokens(20))
         .expect("completion");
@@ -546,7 +548,7 @@ fn probe_verdict_degrades_loudly_on_lfm2() {
     // recorded (happens-before via the response channel; no polling needed).
     //
     // NOTE: this test's name pins model-specific behavior (03-M-4) — "probe
-    // must be false" is a property of the hybrid-arch GGUF at MODEL_230M. If
+    // must be false" is a property of the hybrid-arch GGUF behind HYBRID. If
     // that file is ever swapped for a rewind-capable model, the name, the
     // skip below, and the asserted expectation must move together.
     //
@@ -569,7 +571,7 @@ fn probe_verdict_degrades_loudly_on_lfm2() {
             return;
         }
     }
-    if reuse_model_path().is_some() {
+    if model_attention().is_some() {
         eprintln!(
             "skipped: LLAMAD_TEST_MODEL (or bundled attention model) present — the \
              inverted (reuse-engages) probe contract is covered by \
@@ -578,7 +580,7 @@ fn probe_verdict_degrades_loudly_on_lfm2() {
         return;
     }
     install_capture_layer();
-    let client = Client::new(model_230m()).expect("load 230M model");
+    let client = Client::new(model_hybrid()).expect("load hybrid model");
     let result = client.complete(short_req("Hi")).expect("completion");
     assert!(!result.text.is_empty(), "completion should generate text");
 
