@@ -188,6 +188,33 @@ pub(crate) fn prepare_request(
     })
 }
 
+/// Hand a prepared command to the inference thread, reporting the failure to
+/// the request's own channels if that thread has already exited.
+///
+/// `SendError` gives the whole command back, which is what makes this
+/// uniform: rather than each call site matching on the variant it just sent
+/// (and needing an `unreachable!` for the ones it cannot have sent), the
+/// returned command is destructured once, here.
+fn forward(prepared_tx: &mpsc::Sender<PreparedCmd>, cmd: PreparedCmd) {
+    let Err(mpsc::SendError(returned)) = prepared_tx.send(cmd) else {
+        return;
+    };
+    match returned {
+        PreparedCmd::Run { resp, .. } => {
+            let _ = resp.send(Err(LlamaError::InferenceCrashed));
+        }
+        PreparedCmd::RunStream {
+            token_tx, done_tx, ..
+        } => {
+            if let Some(done) = done_tx {
+                let _ = done.send(Err(LlamaError::InferenceCrashed));
+            }
+            drop(token_tx);
+        }
+        PreparedCmd::Shutdown => {}
+    }
+}
+
 /// Preprocess thread: receive raw client commands, prepare them, forward
 /// pre-tokenized work to the inference thread.
 pub(super) fn preprocess_loop(
@@ -210,14 +237,9 @@ pub(super) fn preprocess_loop(
     for cmd in cmd_rx {
         match cmd {
             InferCmd::Run { request, resp } => match prepare_request(&model, &request, budget) {
-                Ok(req) => match prepared_tx.send(PreparedCmd::Run { req, resp }) {
-                    Ok(()) => {}
-                    Err(mpsc::SendError(PreparedCmd::Run { resp, .. })) => {
-                        let _ = resp.send(Err(LlamaError::InferenceCrashed));
-                    }
-                    Err(_) => unreachable!("Run arm can only fail with Run"),
-                },
+                Ok(req) => forward(&prepared_tx, PreparedCmd::Run { req, resp }),
                 Err(e) => {
+                    tracing::debug!("request rejected in preprocessing: {e}");
                     let _ = resp.send(Err(e));
                 }
             },
@@ -226,26 +248,16 @@ pub(super) fn preprocess_loop(
                 token_tx,
                 done_tx,
             } => match prepare_request(&model, &request, budget) {
-                Ok(req) => {
-                    match prepared_tx.send(PreparedCmd::RunStream {
+                Ok(req) => forward(
+                    &prepared_tx,
+                    PreparedCmd::RunStream {
                         req,
                         token_tx,
                         done_tx,
-                    }) {
-                        Ok(()) => {}
-                        Err(mpsc::SendError(PreparedCmd::RunStream {
-                            token_tx, done_tx, ..
-                        })) => {
-                            if let Some(done) = done_tx {
-                                let _ = done.send(Err(LlamaError::InferenceCrashed));
-                            }
-                            drop(token_tx);
-                        }
-                        Err(_) => unreachable!("RunStream arm can only fail with RunStream"),
-                    }
-                }
+                    },
+                ),
                 Err(e) => {
-                    tracing::error!("Failed to prepare streaming request: {e}");
+                    tracing::debug!("streaming request rejected in preprocessing: {e}");
                     if let Some(done) = done_tx {
                         let _ = done.send(Err(e));
                     }
