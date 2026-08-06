@@ -110,22 +110,36 @@ echo
 # This is a guard, not a tuning knob: if it ever fires, the run stops with a
 # clear message instead of the machine freezing.
 MIN_AVAIL_MB=2500
+# Consecutive low samples required before acting. One reading is not evidence:
+# a single link step can dip `available` briefly, and killing a 15-minute run
+# on a blip is its own kind of failure. Three samples over ~9s distinguishes a
+# transient from a machine actually heading for the OOM killer.
+LOW_STREAK_LIMIT=3
+MEM_TRACE="${TMPDIR}/memory-trace.log"
 
 cargo mutants "$@" &
 mutants_pid=$!
 
 watchdog() {
+    local streak=0 avail
+    : > "$MEM_TRACE"
     while kill -0 "$mutants_pid" 2>/dev/null; do
         avail=$(free -m | awk '/^Mem:/{print $7}')
+        printf '%s %s\n' "$(date +%H:%M:%S)" "$avail" >> "$MEM_TRACE"
         if [ "$avail" -lt "$MIN_AVAIL_MB" ]; then
-            echo >&2
-            echo "watchdog: available memory fell to ${avail}MB (floor ${MIN_AVAIL_MB}MB) — stopping." >&2
-            echo "          Lower --jobserver-tasks and re-run." >&2
-            pkill -TERM -P "$mutants_pid" 2>/dev/null
-            kill -TERM "$mutants_pid" 2>/dev/null
-            sleep 5
-            kill -KILL "$mutants_pid" 2>/dev/null
-            return 1
+            streak=$((streak + 1))
+            if [ "$streak" -ge "$LOW_STREAK_LIMIT" ]; then
+                echo >&2
+                echo "watchdog: available memory stayed under ${MIN_AVAIL_MB}MB for ${streak} samples (last ${avail}MB)." >&2
+                echo "          Stopping before the kernel does. Trace: $MEM_TRACE" >&2
+                pkill -TERM -P "$mutants_pid" 2>/dev/null
+                kill -TERM "$mutants_pid" 2>/dev/null
+                sleep 5
+                kill -KILL "$mutants_pid" 2>/dev/null
+                return 1
+            fi
+        else
+            streak=0
         fi
         sleep 3
     done
