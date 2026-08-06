@@ -2222,4 +2222,146 @@ mod tests {
         assert_eq!(slot.kv_pos as usize, slot.cache_tokens.len());
         assert_eq!(slot.cache_tokens, tokens);
     }
+    // ── Properties ───────────────────────────────────────────────────────────
+    //
+    // The example tests above cover the cases someone thought of. These cover
+    // the shape of the input space: arbitrary Unicode split at arbitrary byte
+    // offsets, which is exactly what a tokenizer hands `push_raw_bytes`, and
+    // what the stop-sequence hold-back has to slice without landing inside a
+    // character.
+
+    use proptest::prelude::*;
+
+    /// Split `bytes` at the given offsets, each taken modulo the remaining
+    /// length so any generated vector produces a valid chunking.
+    fn chunk(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rest = bytes;
+        for &c in cuts {
+            if rest.is_empty() {
+                break;
+            }
+            let at = c % (rest.len() + 1);
+            let (head, tail) = rest.split_at(at);
+            out.push(head.to_vec());
+            rest = tail;
+        }
+        out.push(rest.to_vec());
+        out
+    }
+
+    proptest! {
+        /// Reassembly is lossless however the tokenizer splits the bytes.
+        ///
+        /// This is the contract `push_raw_bytes` exists for: a multi-byte
+        /// character may arrive across two detokenized pieces, and the decoder
+        /// must buffer rather than emit a replacement character or error.
+        #[test]
+        fn prop_utf8_reassembly_is_lossless(
+            text in ".{0,64}",
+            cuts in prop::collection::vec(any::<usize>(), 0..8),
+        ) {
+            let mut slot = base_slot();
+            let mut out = String::new();
+            for piece in chunk(text.as_bytes(), &cuts) {
+                // Valid UTF-8 split anywhere can never be *permanently*
+                // invalid, only incomplete — so this must never error.
+                let got = slot.push_raw_bytes(&piece)
+                    .expect("a split of valid utf-8 is never permanently invalid");
+                if let Some(s) = got {
+                    out.push_str(&s);
+                }
+            }
+            prop_assert_eq!(&out, &text, "reassembled text differs from input");
+            prop_assert!(
+                slot.utf8_buf.is_empty(),
+                "buffer left holding {:?} after complete input",
+                slot.utf8_buf
+            );
+        }
+
+        /// Every byte in `text` is eventually streamed, and nothing else is.
+        ///
+        /// Hold-back delays bytes that might still grow into a stop sequence;
+        /// the risk is that a delayed byte is never released, silently
+        /// truncating output. Generation ending without a match must flush.
+        #[test]
+        fn prop_no_stop_match_streams_everything(
+            pieces in prop::collection::vec(".{0,16}", 0..6),
+            stop in "[a-zA-Z]{1,4}",
+        ) {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut slot = streaming_slot(tx, &[stop.as_str()]);
+
+            let mut stopped = false;
+            for piece in &pieces {
+                if slot.push_text(piece) == Emit::Stopped {
+                    stopped = true;
+                    break;
+                }
+            }
+            let expected = slot.text.clone();
+            if !stopped {
+                slot.finish();
+            }
+            // `finish` takes `text`, so compare against the snapshot above.
+            let streamed = drain(&mut rx);
+            prop_assert_eq!(
+                streamed,
+                expected,
+                "streamed bytes must equal the accumulated text exactly"
+            );
+        }
+
+        /// Hold-back never splits a character.
+        ///
+        /// The offsets come from byte lengths, so a naive implementation
+        /// slices mid-character and panics. Multi-byte stop sequences and
+        /// multi-byte output are generated deliberately here.
+        #[test]
+        fn prop_holdback_lands_on_a_char_boundary(
+            text in "[aé→𝄞]{0,24}",
+            stop in "[aé→𝄞]{1,3}",
+        ) {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut slot = streaming_slot(tx, &[stop.as_str()]);
+            slot.text = text;
+            let held = slot.holdback();
+            prop_assert!(held <= slot.text.len());
+            let cut = slot.text.len() - held;
+            prop_assert!(
+                slot.text.is_char_boundary(cut),
+                "holdback {held} puts the cut at {cut}, inside a character of {:?}",
+                slot.text
+            );
+        }
+
+        /// `floor_char_boundary` returns a boundary at or below its argument.
+        #[test]
+        fn prop_floor_char_boundary_is_a_boundary(
+            text in "[aé→𝄞]{0,24}",
+            i in 0usize..64,
+        ) {
+            let got = floor_char_boundary(&text, i);
+            prop_assert!(got <= i.min(text.len()));
+            prop_assert!(text.is_char_boundary(got));
+        }
+
+        /// The prefix length is a real common prefix, and maximal.
+        #[test]
+        fn prop_lcp_is_a_maximal_common_prefix(
+            a in prop::collection::vec(0i32..6, 0..12),
+            b in prop::collection::vec(0i32..6, 0..12),
+        ) {
+            let ta: Vec<LlamaToken> = a.iter().copied().map(LlamaToken::new).collect();
+            let tb: Vec<LlamaToken> = b.iter().copied().map(LlamaToken::new).collect();
+            let n = longest_common_prefix(&ta, &tb);
+            prop_assert!(n <= ta.len().min(tb.len()));
+            prop_assert_eq!(&ta[..n], &tb[..n], "reported prefix is not shared");
+            // Maximal: the next pair, if any, must differ.
+            if n < ta.len().min(tb.len()) {
+                prop_assert_ne!(ta[n], tb[n], "prefix could have been longer");
+            }
+        }
+    }
 }

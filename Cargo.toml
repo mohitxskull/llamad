@@ -113,5 +113,10 @@ all = "warn"
 
 [dev-dependencies]
 serial_test = "4.0.1"
+# Property tests for the UTF-8 reassembly and stop-sequence logic — the two
+# places where the example-based tests can only cover the cases someone thought
+# of, and where the failure mode (a panic on a char boundary, a silently
+# dropped fragment) is exactly what random inputs are good at finding.
+proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
