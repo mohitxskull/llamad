@@ -422,26 +422,35 @@ fn build_sampler(
 
 // ── Slot creation ─────────────────────────────────────────────────────────────
 
-/// Assemble a slot from a prepared request and an already-built sampler.
+/// Where a request's outcome is sent: `resp` for a non-streaming caller,
+/// `token_tx`/`done_tx` for a streaming one. Exactly one shape is populated.
+///
+/// Grouped rather than passed as three parallel parameters because
+/// [`create_slot`] and [`reject`] both take all three in the same order, and a
+/// named field is harder to mis-wire than a positional `Option<Sender<_>>`.
+#[derive(Default)]
+struct Channels {
+    resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
+    token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
+}
+
+/// Assemble a slot for a prepared request and an already-built sampler.
 ///
 /// The sampler is built by the caller rather than here so that a grammar
 /// failure can be reported to the client *before* the response channels are
 /// moved into the slot.
-fn create_slot(
-    tokens: Vec<LlamaToken>,
-    max_gen: u32,
-    sampler: LlamaSampler,
-    stop: Vec<String>,
-    resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
-    token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
-) -> Slot {
-    let n_prompt = tokens.len();
+///
+/// The prompt is deliberately *not* a parameter: the caller follows this with
+/// [`Slot::begin_request`], which installs the tokens and derives `n_prompt`
+/// and `kv_pos` from the slot's retained KV prefix. Taking the tokens here too
+/// would mean computing `n_prompt` twice from different sources.
+fn create_slot(max_gen: u32, sampler: LlamaSampler, stop: Vec<String>, channels: Channels) -> Slot {
     let stop_max_len = stop.iter().map(String::len).max().unwrap_or(0);
 
     Slot {
-        prompt_tokens: tokens,
-        n_prompt,
+        prompt_tokens: Vec::new(),
+        n_prompt: 0,
         gen_count: 0,
         max_tokens: max_gen,
         kv_pos: 0,
@@ -452,9 +461,9 @@ fn create_slot(
         text: String::with_capacity((max_gen as usize).min(512) * 4),
         pending_token: None,
         prompt_phase: true,
-        resp,
-        token_tx,
-        done_tx,
+        resp: channels.resp,
+        token_tx: channels.token_tx,
+        done_tx: channels.done_tx,
         cache_tokens: Vec::new(),
         stop,
         stop_max_len,
@@ -478,23 +487,23 @@ fn create_slot(
 /// every path below full-clears seq 0 afterwards.
 fn probe_kv_rewind(model: &LlamaModel, ctx: &mut LlamaContext) -> bool {
     let mut batch = LlamaBatch::new(8, 2);
-    let probe_seq: i32 = 0; // scratch seq id; full-cleared after the probe
+    let probe_seq: u32 = 0; // scratch seq id; full-cleared after the probe
     // BOS-less vocabularies report LLAMA_TOKEN_NULL (-1), which the batch
     // validator rejects; fall back to token 0.
     let bos = model.token_bos();
     let tok = if bos.0 == -1 { LlamaToken::new(0) } else { bos };
-    let ok_add = batch.add(tok, 0, &[probe_seq], false).is_ok()
-        && batch.add(tok, 1, &[probe_seq], true).is_ok();
+    let ok_add = batch.add(tok, 0, &[probe_seq as i32], false).is_ok()
+        && batch.add(tok, 1, &[probe_seq as i32], true).is_ok();
     if !ok_add || ctx.decode(&mut batch).is_err() {
-        let _ = ctx.clear_kv_cache_seq(Some(probe_seq as u32), None, None);
+        let _ = ctx.clear_kv_cache_seq(Some(probe_seq), None, None);
         return false; // decode itself failed — degrade to be safe
     }
     // Attempt to remove [1, ...): works only if partial rewind is supported.
     let rewinds = ctx
-        .clear_kv_cache_seq(Some(probe_seq as u32), Some(1), None)
+        .clear_kv_cache_seq(Some(probe_seq), Some(1), None)
         .unwrap_or(false);
     // Always leave the scratch seq clean.
-    let _ = ctx.clear_kv_cache_seq(Some(probe_seq as u32), None, None);
+    let _ = ctx.clear_kv_cache_seq(Some(probe_seq), None, None);
     rewinds
 }
 
@@ -548,103 +557,14 @@ fn select_slot(
 }
 
 /// Report `err` to whichever response channels a request carried.
-fn reject(
-    err: LlamaError,
-    resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
-    token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
-) {
-    if let Some(resp) = resp {
+fn reject(err: LlamaError, channels: Channels) {
+    if let Some(resp) = channels.resp {
         let _ = resp.send(Err(err.clone()));
     }
-    if let Some(done) = done_tx {
+    if let Some(done) = channels.done_tx {
         let _ = done.send(Err(err));
     }
-    drop(token_tx);
-}
-
-fn fill_empty_slot(
-    model: &LlamaModel,
-    ctx: &mut LlamaContext,
-    slots: &mut [Option<Slot>],
-    slot_cache: &mut [Vec<LlamaToken>],
-    cmd: PreparedCmd,
-) {
-    // Destructured by value, and before slot selection: cloning `req.tokens`
-    // would copy the whole tokenized prompt on every request, and
-    // `select_slot` needs them to score each free slot's cached prefix.
-    let (req, resp, token_tx, done_tx) = match cmd {
-        PreparedCmd::Run { req, resp } => (req, Some(resp), None, None),
-        PreparedCmd::RunStream {
-            req,
-            token_tx,
-            done_tx,
-        } => (req, None, Some(token_tx), done_tx),
-        PreparedCmd::Shutdown => {
-            tracing::warn!("Shutdown received outside of main loop");
-            return;
-        }
-    };
-
-    // Built before the slot is claimed so a failure costs nothing. The
-    // preprocess thread already validated any grammar against this same
-    // vocabulary, so this error path is defence in depth rather than the
-    // primary check — but it must not panic the inference thread either way.
-    let sampler = match build_sampler(model, req.sampling, req.grammar.as_ref()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("sampler construction failed: {e}");
-            reject(e, resp, token_tx, done_tx);
-            return;
-        }
-    };
-
-    let idx = match select_slot(slots, slot_cache, &req.tokens) {
-        Some(i) => i,
-        None => {
-            tracing::warn!("All slots full, dropping request");
-            reject(LlamaError::Busy, resp, token_tx, done_tx);
-            return;
-        }
-    };
-    let mut slot = create_slot(
-        Vec::new(),
-        req.max_gen,
-        sampler,
-        req.stop,
-        resp,
-        token_tx,
-        done_tx,
-    );
-    let cached = std::mem::take(&mut slot_cache[idx]);
-    let lcp = slot.begin_request(req.tokens, cached);
-    if lcp > 0 {
-        // Drop the old tail beyond the shared prefix; the prefill below
-        // rewrites [kv_pos, n_prompt) anyway, so clearing from lcp covers
-        // both divergent and generated tails. Checked, not `let _ =`:
-        // a refused partial removal means the cache cannot be trusted —
-        // fall back to a full clear and rewind the slot to a full prefill.
-        let rewound = ctx
-            .clear_kv_cache_seq(Some(idx as u32), Some(lcp as u32), None)
-            .unwrap_or(false);
-        if rewound {
-            tracing::debug!("slot {idx} reused {lcp} cached tokens");
-        } else {
-            fallback_to_full_prefill(&mut slot, lcp, idx);
-            let _ = ctx.clear_kv_cache_seq(Some(idx as u32), None, None);
-        }
-    } else {
-        // The clear must be unconditional, not gated on the mirror having
-        // held tokens: an empty mirror cannot guarantee the seq's KV is
-        // empty — prompt-overflow-canceled slots have their partially-added
-        // tokens decoded into the KV *after* the cancel-site clear (the
-        // cancel drops the slot from the batch, but the shared batch still
-        // decodes its already-added tokens). Every empty-cache fill must
-        // therefore reconcile with a full clear; on a fresh or already-clean
-        // seq this is a cheap no-op scan.
-        let _ = ctx.clear_kv_cache_seq(Some(idx as u32), None, None);
-    }
-    slots[idx] = Some(slot);
+    drop(channels.token_tx);
 }
 
 // ── Cancel all active slots ───────────────────────────────────────────────────
@@ -681,6 +601,30 @@ fn retire_slot(
         slot_cache[seq_id].clear();
         let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
     }
+}
+
+/// Fail a slot and return its sequence to a known-empty state.
+///
+/// The unconditional full clear is what makes the state *known*: a failed slot
+/// may have left tokens in the KV that the mirror never recorded (see the
+/// empty-mirror note in `fill_empty_slot`), so trusting the mirror here would
+/// let the next fill compute an lcp against a sequence that is not what the
+/// context actually holds.
+///
+/// Every abnormal exit routes through this, so the three steps cannot drift
+/// apart between sites. The one deliberate exception is batch overflow *during
+/// generation*, which refreshes the mirror instead of clearing it — that site
+/// stays written out, with its reasoning, precisely because it differs.
+fn abandon_slot(
+    ctx: &mut LlamaContext,
+    slot: &mut Slot,
+    slot_cache: &mut [Vec<LlamaToken>],
+    seq_id: usize,
+    err: LlamaError,
+) {
+    slot.cancel(err);
+    slot_cache[seq_id].clear();
+    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
 }
 
 fn cancel_all(slots: &mut [Option<Slot>], slot_cache: &mut [Vec<LlamaToken>], err: LlamaError) {
@@ -816,16 +760,21 @@ fn inference_loop(
             "KV prefix reuse disabled: partial KV rewind unsupported by this model; full prefill per request"
         );
     }
-    let mut slots: Vec<Option<Slot>> = (0..config.n_slots).map(|_| None).collect();
-
-    // Token history of each slot's last completed sequence, kept so the KV
-    // prefix can be reused on the next request into that slot.
-    let mut slot_cache: Vec<Vec<LlamaToken>> = vec![Vec::new(); config.n_slots];
-
-    // Reusable per-step scratch: allocated once, reset every iteration.
-    let mut batch = LlamaBatch::new(config.n_ctx as usize, config.n_slots as i32);
-    let mut slot_batch_idx: Vec<Option<usize>> = vec![None; config.n_slots];
-    let mut taken: Vec<(usize, Slot)> = Vec::with_capacity(config.n_slots);
+    let mut sched = Scheduler {
+        model: &model,
+        ctx,
+        slots: (0..config.n_slots).map(|_| None).collect(),
+        // Token history of each slot's last completed sequence, kept so the KV
+        // prefix can be reused on the next request into that slot.
+        slot_cache: vec![Vec::new(); config.n_slots],
+        // Reusable per-step scratch: allocated once, reset every step.
+        batch: LlamaBatch::new(config.n_ctx as usize, config.n_slots as i32),
+        slot_batch_idx: vec![None; config.n_slots],
+        taken: Vec::with_capacity(config.n_slots),
+        n_slots: config.n_slots,
+        per_slot_budget,
+        reuse: reuse_allowed(config.kv_cache, kv_rewind),
+    };
 
     // ── Main loop ────────────────────────────────────────────────────────
     loop {
@@ -838,54 +787,261 @@ fn inference_loop(
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!(
                 "Shutdown requested, cancelling {} active slots",
-                slots.iter().filter(|s| s.is_some()).count()
+                sched.active_count()
             );
-            cancel_all(&mut slots, &mut slot_cache, LlamaError::InferenceCrashed);
+            sched.cancel_all(LlamaError::InferenceCrashed);
             return;
         }
 
-        // 1. Non-blocking drain of new requests into empty slots
-        loop {
-            let has_empty = slots.iter().any(|s| s.is_none());
-            if !has_empty {
-                break;
-            }
+        // 1. Non-blocking drain of new requests into empty slots.
+        // 2. If no slots are active, block until the next request.
+        match sched.admit_pending(&rx) {
+            Admit::Continue => {}
+            Admit::Restart => continue,
+            Admit::Stop => return,
+        }
+
+        // 3-6. Build one batch from every active slot, decode it, and turn the
+        //      logits into tokens.
+        sched.step();
+    }
+}
+
+// ── Scheduler ─────────────────────────────────────────────────────────────────
+
+/// What the admission phase decided the main loop should do next.
+enum Admit {
+    /// Slots are ready; proceed to the decode step.
+    Continue,
+    /// State changed such that the loop should re-evaluate from the top
+    /// (a request was admitted while nothing was running).
+    Restart,
+    /// Shutdown, or the command channel closed. The thread exits.
+    Stop,
+}
+
+/// The inference thread's state for one loaded model, and the phases of one
+/// decode step.
+///
+/// A struct rather than a single `loop` body: the step has four distinct
+/// phases that each need most of the same state, and grouping it is what lets
+/// each phase be a named method instead of a numbered comment. `model` and
+/// `ctx` share the caller's `'a` because the context borrows the model — the
+/// `Arc<LlamaModel>` stays owned by `inference_loop` so this struct is not
+/// self-referential.
+struct Scheduler<'a> {
+    model: &'a LlamaModel,
+    ctx: LlamaContext<'a>,
+    /// One entry per slot; `None` when that slot is free.
+    slots: Vec<Option<Slot>>,
+    /// Mirror of what each slot's KV sequence holds, for prefix reuse.
+    slot_cache: Vec<Vec<LlamaToken>>,
+    batch: LlamaBatch,
+    /// Where each slot's logits landed in `batch`, valid for one step.
+    slot_batch_idx: Vec<Option<usize>>,
+    /// Slots pulled out of `slots` for the current step, returned there (or
+    /// retired) once their token has been sampled.
+    taken: Vec<(usize, Slot)>,
+    n_slots: usize,
+    per_slot_budget: u32,
+    /// Whether a completed sequence is retained for prefix reuse.
+    reuse: bool,
+}
+
+impl Scheduler<'_> {
+    fn active_count(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Fail `slot` and reset its sequence. See [`abandon_slot`].
+    fn abandon(&mut self, slot: &mut Slot, seq_id: usize, err: LlamaError) {
+        abandon_slot(&mut self.ctx, slot, &mut self.slot_cache, seq_id, err);
+    }
+
+    /// Retire a normally-finished `slot`. See [`retire_slot`].
+    fn retire(&mut self, slot: &mut Slot, seq_id: usize) {
+        retire_slot(
+            &mut self.ctx,
+            slot,
+            &mut self.slot_cache,
+            seq_id,
+            self.reuse,
+            self.per_slot_budget,
+        );
+    }
+
+    fn cancel_all(&mut self, err: LlamaError) {
+        cancel_all(&mut self.slots, &mut self.slot_cache, err);
+    }
+
+    /// Phases 1-2: drain ready requests into free slots, and park on the
+    /// channel when there is nothing to decode.
+    fn admit_pending(&mut self, rx: &mpsc::Receiver<PreparedCmd>) -> Admit {
+        // Non-blocking drain of new requests into empty slots.
+        while self.slots.iter().any(|s| s.is_none()) {
             match rx.try_recv() {
                 Ok(PreparedCmd::Shutdown) => {
                     tracing::info!(
                         "Shutdown received, draining {} active slots",
-                        slots.iter().filter(|s| s.is_some()).count()
+                        self.active_count()
                     );
-                    cancel_all(&mut slots, &mut slot_cache, LlamaError::InferenceCrashed);
-                    return;
+                    self.cancel_all(LlamaError::InferenceCrashed);
+                    return Admit::Stop;
                 }
-                Ok(cmd) => fill_empty_slot(&model, &mut ctx, &mut slots, &mut slot_cache, cmd),
+                Ok(cmd) => self.admit_one(cmd),
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Disconnected) => return Admit::Stop,
             }
         }
 
-        // 2. If no slots active, block until the next request
-        let has_active = slots.iter().any(|s| s.is_some());
-        if !has_active {
+        // If no slots are active, block until the next request.
+        if self.slots.iter().all(|s| s.is_none()) {
             match rx.recv() {
                 Ok(PreparedCmd::Shutdown) => {
                     tracing::info!("Shutdown received");
-                    return;
+                    return Admit::Stop;
                 }
-                Ok(cmd) => fill_empty_slot(&model, &mut ctx, &mut slots, &mut slot_cache, cmd),
-                Err(_) => return,
+                Ok(cmd) => self.admit_one(cmd),
+                Err(_) => return Admit::Stop,
             }
-            continue;
+            return Admit::Restart;
         }
 
-        // 3. Build batch from all active slots.
-        batch.clear();
-        slot_batch_idx.fill(None);
-        taken.clear();
+        Admit::Continue
+    }
 
-        for seq_id in 0..config.n_slots {
-            let mut slot = match slots[seq_id].take() {
+    /// Route one prepared request into a free slot, reconciling that slot's KV
+    /// with the prefix it can reuse. Rejected requests never claim a slot.
+    fn admit_one(&mut self, cmd: PreparedCmd) {
+        // Destructured by value, and before slot selection: cloning `req.tokens`
+        // would copy the whole tokenized prompt on every request, and
+        // `select_slot` needs them to score each free slot's cached prefix.
+        let (req, channels) = match cmd {
+            PreparedCmd::Run { req, resp } => (
+                req,
+                Channels {
+                    resp: Some(resp),
+                    ..Default::default()
+                },
+            ),
+            PreparedCmd::RunStream {
+                req,
+                token_tx,
+                done_tx,
+            } => (
+                req,
+                Channels {
+                    resp: None,
+                    token_tx: Some(token_tx),
+                    done_tx,
+                },
+            ),
+            PreparedCmd::Shutdown => {
+                tracing::warn!("Shutdown received outside of main loop");
+                return;
+            }
+        };
+
+        // Built before the slot is claimed so a failure costs nothing. The
+        // preprocess thread already validated any grammar against this same
+        // vocabulary, so this error path is defence in depth rather than the
+        // primary check — but it must not panic the inference thread either way.
+        let sampler = match build_sampler(self.model, req.sampling, req.grammar.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("sampler construction failed: {e}");
+                reject(e, channels);
+                return;
+            }
+        };
+
+        let idx = match select_slot(&self.slots, &self.slot_cache, &req.tokens) {
+            Some(i) => i,
+            None => {
+                tracing::warn!("All slots full, dropping request");
+                reject(LlamaError::Busy, channels);
+                return;
+            }
+        };
+        let mut slot = create_slot(req.max_gen, sampler, req.stop, channels);
+        let cached = std::mem::take(&mut self.slot_cache[idx]);
+        let lcp = slot.begin_request(req.tokens, cached);
+        if lcp > 0 {
+            // Drop the old tail beyond the shared prefix; the prefill below
+            // rewrites [kv_pos, n_prompt) anyway, so clearing from lcp covers
+            // both divergent and generated tails. Checked, not `let _ =`:
+            // a refused partial removal means the cache cannot be trusted —
+            // fall back to a full clear and rewind the slot to a full prefill.
+            let rewound = self
+                .ctx
+                .clear_kv_cache_seq(Some(idx as u32), Some(lcp as u32), None)
+                .unwrap_or(false);
+            if rewound {
+                tracing::debug!("slot {idx} reused {lcp} cached tokens");
+            } else {
+                fallback_to_full_prefill(&mut slot, lcp, idx);
+                let _ = self.ctx.clear_kv_cache_seq(Some(idx as u32), None, None);
+            }
+        } else {
+            // The clear must be unconditional, not gated on the mirror having
+            // held tokens: an empty mirror cannot guarantee the seq's KV is
+            // empty — prompt-overflow-canceled slots have their partially-added
+            // tokens decoded into the KV *after* the cancel-site clear (the
+            // cancel drops the slot from the batch, but the shared batch still
+            // decodes its already-added tokens). Every empty-cache fill must
+            // therefore reconcile with a full clear; on a fresh or already-clean
+            // seq this is a cheap no-op scan.
+            let _ = self.ctx.clear_kv_cache_seq(Some(idx as u32), None, None);
+        }
+        self.slots[idx] = Some(slot);
+    }
+
+    /// Phases 3-6 of one decode step: build the batch, decode it, and sample.
+    fn step(&mut self) {
+        self.build_batch();
+
+        // If the batch is empty, skip decode.
+        if self.batch.n_tokens() == 0 {
+            let mut taken = std::mem::take(&mut self.taken);
+            for (seq_id, mut slot) in taken.drain(..) {
+                self.abandon(
+                    &mut slot,
+                    seq_id,
+                    LlamaError::Inference(
+                        "internal: empty batch after building from active slots".into(),
+                    ),
+                );
+            }
+            self.taken = taken; // keep the allocation
+            return;
+        }
+
+        // Decode — one call for every active sequence. `ctx` and `batch` are
+        // disjoint fields, so this borrows both directly.
+        if let Err(e) = self.ctx.decode(&mut self.batch) {
+            let mut taken = std::mem::take(&mut self.taken);
+            for (seq_id, mut slot) in taken.drain(..) {
+                self.abandon(&mut slot, seq_id, LlamaError::Inference(e.to_string()));
+            }
+            self.taken = taken;
+            return;
+        }
+
+        self.harvest();
+    }
+
+    /// Phase 3: build one batch from every active slot.
+    ///
+    /// Each slot is taken out of `slots` for the duration: a slot that stays
+    /// in the batch moves to `taken` and is put back by [`Self::harvest`], and
+    /// one that fails here is dropped without ever going back.
+    fn build_batch(&mut self) {
+        self.batch.clear();
+        self.slot_batch_idx.fill(None);
+        self.taken.clear();
+
+        for seq_id in 0..self.n_slots {
+            let mut slot = match self.slots[seq_id].take() {
                 Some(s) => s,
                 None => continue,
             };
@@ -904,7 +1060,8 @@ fn inference_loop(
                     // position would fail decode. Free the last cell by rewinding
                     // from n_prompt - 1; n_prompt == 1 clears from 0 = full clear,
                     // which is also correct.
-                    let rewound = ctx
+                    let rewound = self
+                        .ctx
                         .clear_kv_cache_seq(
                             Some(seq_id as u32),
                             Some((slot.n_prompt - 1) as u32),
@@ -921,71 +1078,72 @@ fn inference_loop(
                         // on attention models where reuse engages, but mirror the
                         // fill-time fallback and re-add the whole prompt from 0.
                         fallback_to_full_prefill(&mut slot, reused as usize, seq_id);
-                        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                        let _ = self.ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
                         reused = 0;
                     }
                 }
                 for (i, &tok) in slot.prompt_tokens.iter().enumerate().skip(reused as usize) {
-                    let idx = batch.n_tokens() as usize;
+                    let idx = self.batch.n_tokens() as usize;
                     let is_last = i == slot.n_prompt - 1;
                     // Positions are kv_pos + i - reused; this equals the absolute
                     // index i only because kv_pos == reused == lcp after
                     // begin_request. The batch must start exactly at
                     // seq_pos_max + 1 (llama-batch.cpp).
-                    if batch
+                    if self
+                        .batch
                         .add(tok, slot.kv_pos + i as i32 - reused, &[sid], is_last)
                         .is_err()
                     {
                         tracing::error!("Batch overflow (prompt seq {seq_id})");
-                        slot.cancel(LlamaError::Inference(
-                            "batch overflow during prompt processing".into(),
-                        ));
-                        slot_cache[seq_id].clear();
-                        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                        self.abandon(
+                            &mut slot,
+                            seq_id,
+                            LlamaError::Inference("batch overflow during prompt processing".into()),
+                        );
                         ok = false;
                         break;
                     }
                     if is_last {
-                        slot_batch_idx[seq_id] = Some(idx);
+                        self.slot_batch_idx[seq_id] = Some(idx);
                     }
                 }
-                if ok && slot_batch_idx[seq_id].is_none() && reused > 0 {
-                    // Zero-token prefill (lcp == n_prompt — identical re-send, or a
-                    // prompt that is a prefix of the cached one): the whole prompt is
-                    // already in KV, so the prefill loop added nothing. The cell at
-                    // n_prompt - 1 was freed by the rewind clear above, so this
-                    // re-add lands at seq_pos_max + 1 — a legal batch — and gives
-                    // the logits anchor the generation phase samples from. Without it
-                    // the slot is canceled with a bogus "internal: empty batch" error
-                    // (solo slot) or silently dropped (other slots active) — the
-                    // plan's own identical-request-twice e2e hits exactly this.
-                    let idx = batch.n_tokens() as usize;
+                if ok && self.slot_batch_idx[seq_id].is_none() && reused > 0 {
+                    // The second half of the zero-token prefill described above:
+                    // the loop added nothing, so re-add the last prompt token into
+                    // the cell that rewind just freed. It lands at seq_pos_max + 1
+                    // (a legal batch) and becomes the logits anchor the generation
+                    // phase samples from. Without it the slot is canceled with a
+                    // bogus "internal: empty batch" error (solo slot) or silently
+                    // dropped (other slots active) — the identical-request-twice
+                    // e2e in tests/reuse.rs hits exactly this.
+                    let idx = self.batch.n_tokens() as usize;
                     let last = (slot.n_prompt - 1) as i32;
-                    if batch
+                    if self
+                        .batch
                         .add(slot.prompt_tokens[last as usize], last, &[sid], true)
                         .is_err()
                     {
                         tracing::error!("Batch overflow (prompt seq {seq_id})");
-                        slot.cancel(LlamaError::Inference(
-                            "batch overflow during prompt processing".into(),
-                        ));
-                        slot_cache[seq_id].clear();
-                        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                        self.abandon(
+                            &mut slot,
+                            seq_id,
+                            LlamaError::Inference("batch overflow during prompt processing".into()),
+                        );
                         ok = false;
                     } else {
-                        slot_batch_idx[seq_id] = Some(idx);
+                        self.slot_batch_idx[seq_id] = Some(idx);
                     }
                 }
                 if ok {
                     slot.finish_prefill();
-                    taken.push((seq_id, slot));
+                    self.taken.push((seq_id, slot));
                 }
             } else if let Some(token) = slot.pending_token {
-                let idx = batch.n_tokens() as usize;
-                if batch.add(token, slot.kv_pos, &[sid], true).is_ok() {
-                    slot_batch_idx[seq_id] = Some(idx);
+                let idx = self.batch.n_tokens() as usize;
+                if self.batch.add(token, slot.kv_pos, &[sid], true).is_ok() {
+                    self.slot_batch_idx[seq_id] = Some(idx);
                     slot.kv_pos += 1;
-                    taken.push((seq_id, slot));
+                    self.taken.push((seq_id, slot));
                 } else {
                     tracing::error!("Batch overflow (gen seq {seq_id})");
                     // Refresh the mirror to the sequence actually in KV
@@ -994,52 +1152,33 @@ fn inference_loop(
                     // fill's lcp is computed against the current sequence,
                     // and the fill-time clear [lcp, ∞) always covers its
                     // entire range. (Do NOT clear the mirror — that would
-                    // recreate the prompt-overflow failure mode.)
-                    slot_cache[seq_id] = std::mem::take(&mut slot.cache_tokens);
+                    // recreate the prompt-overflow failure mode, so this site
+                    // deliberately does not use `abandon`.)
+                    self.slot_cache[seq_id] = std::mem::take(&mut slot.cache_tokens);
                     slot.cancel(LlamaError::Inference(
                         "batch overflow during generation".into(),
                     ));
                 }
             } else {
-                slots[seq_id] = Some(slot);
+                self.slots[seq_id] = Some(slot);
             }
         }
+    }
 
-        // 4. If the batch is empty, skip decode.
-        if batch.n_tokens() == 0 {
-            if !taken.is_empty() {
-                for (seq_id, mut slot) in taken.drain(..) {
-                    slot.cancel(LlamaError::Inference(
-                        "internal: empty batch after building from active slots".into(),
-                    ));
-                    slot_cache[seq_id].clear();
-                    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-                }
-            }
-            continue;
-        }
-
-        // 5. Decode — one call for every active sequence.
-        if let Err(e) = ctx.decode(&mut batch) {
-            for (seq_id, mut slot) in taken.drain(..) {
-                slot.cancel(LlamaError::Inference(e.to_string()));
-                slot_cache[seq_id].clear();
-                let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
-            }
-            continue;
-        }
-
-        // 6. Sample and process each taken slot.
+    /// Phase 6: sample one token per decoded slot, emit it, and either put the
+    /// slot back for the next step or retire it.
+    fn harvest(&mut self) {
+        let mut taken = std::mem::take(&mut self.taken);
         for (seq_id, mut slot) in taken.drain(..) {
-            let batch_idx = match slot_batch_idx[seq_id] {
+            let batch_idx = match self.slot_batch_idx[seq_id] {
                 Some(i) => i as i32,
                 None => {
                     tracing::error!("slot {seq_id}: no batch index after prefill");
-                    slot.cancel(LlamaError::Inference(
-                        "internal: no batch index after prefill".into(),
-                    ));
-                    slot_cache[seq_id].clear();
-                    let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                    self.abandon(
+                        &mut slot,
+                        seq_id,
+                        LlamaError::Inference("internal: no batch index after prefill".into()),
+                    );
                     continue;
                 }
             };
@@ -1053,24 +1192,17 @@ fn inference_loop(
             // the grammar two steps per token until its stack empties, at
             // which point llama.cpp throws a C++ exception that unwinds
             // through the thread boundary and aborts the process.
-            let token = slot.sampler.sample(&ctx, batch_idx);
+            let token = slot.sampler.sample(&self.ctx, batch_idx);
 
-            if model.is_eog_token(token) {
+            if self.model.is_eog_token(token) {
                 slot.finish();
-                retire_slot(
-                    &mut ctx,
-                    &mut slot,
-                    &mut slot_cache,
-                    seq_id,
-                    reuse_allowed(config.kv_cache, kv_rewind),
-                    per_slot_budget,
-                );
+                self.retire(&mut slot, seq_id);
                 continue;
             }
 
             slot.gen_count += 1;
 
-            match slot.push_token(&model, token) {
+            match slot.push_token(self.model, token) {
                 Ok(Some(piece)) => match slot.push_text(&piece) {
                     Emit::Continue => {}
                     Emit::Stopped => {
@@ -1079,20 +1211,11 @@ fn inference_loop(
                         // successful finish — the caller gets the output that
                         // preceded the stop, without the stop text itself.
                         slot.finish();
-                        retire_slot(
-                            &mut ctx,
-                            &mut slot,
-                            &mut slot_cache,
-                            seq_id,
-                            reuse_allowed(config.kv_cache, kv_rewind),
-                            per_slot_budget,
-                        );
+                        self.retire(&mut slot, seq_id);
                         continue;
                     }
                     Emit::Disconnected => {
-                        slot.cancel(LlamaError::Disconnected);
-                        slot_cache[seq_id].clear();
-                        let _ = ctx.clear_kv_cache_seq(Some(seq_id as u32), None, None);
+                        self.abandon(&mut slot, seq_id, LlamaError::Disconnected);
                         continue;
                     }
                 },
@@ -1103,22 +1226,18 @@ fn inference_loop(
                 }
             }
 
-            if slot.gen_count as u32 >= slot.max_tokens || slot.kv_pos as u32 >= per_slot_budget {
+            if slot.gen_count as u32 >= slot.max_tokens
+                || slot.kv_pos as u32 >= self.per_slot_budget
+            {
                 slot.finish();
-                retire_slot(
-                    &mut ctx,
-                    &mut slot,
-                    &mut slot_cache,
-                    seq_id,
-                    reuse_allowed(config.kv_cache, kv_rewind),
-                    per_slot_budget,
-                );
+                self.retire(&mut slot, seq_id);
                 continue;
             }
 
             slot.pending_token = Some(token);
-            slots[seq_id] = Some(slot);
+            self.slots[seq_id] = Some(slot);
         }
+        self.taken = taken; // keep the allocation
     }
 }
 
