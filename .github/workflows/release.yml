@@ -99,8 +99,18 @@ jobs:
       - name: Install cargo-semver-checks
         run: cargo install --locked cargo-semver-checks
 
+      # `--default-features` is load-bearing. Without it, cargo-semver-checks
+      # applies a heuristic that enables *every* feature — including `blas`,
+      # `cuda`, `hip`, `metal` and `vulkan`, which exist only to forward to
+      # llama-cpp-4 and need toolchains and driver libraries no hosted runner
+      # has. The first tagged release attempt died exactly there: cmake could
+      # not find BLAS, so rustdoc never built and the check aborted.
+      #
+      # The default set is also the right thing to compare. Those backends
+      # change how llama.cpp is compiled, not llamad's public API, so building
+      # them adds nothing to a semver comparison.
       - name: Public API matches the version bump
-        run: cargo semver-checks check-release
+        run: cargo semver-checks check-release --default-features
 
       # Compiles the packaged tarball, which is what crates.io will build.
       # Catches an `exclude` that dropped a file the crate needs.
