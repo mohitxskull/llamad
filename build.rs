@@ -111,5 +111,55 @@ fn main() {
         if found_httplib {
             println!("cargo:rustc-link-lib=static=cpp-httplib");
         }
+
+        // 4. OpenSSL search paths (in case cpp-httplib or llama.cpp linked against OpenSSL)
+        let openssl_roots = [
+            std::env::var("OPENSSL_ROOT_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
+            std::env::var("OPENSSL_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
+            Some(std::path::PathBuf::from("C:\\Program Files\\OpenSSL")),
+            Some(std::path::PathBuf::from("C:\\Program Files\\OpenSSL-Win64")),
+            Some(std::path::PathBuf::from(
+                "C:\\Program Files (x86)\\OpenSSL-Win32",
+            )),
+        ];
+
+        let mut linked_ssl = false;
+        for root in openssl_roots.into_iter().flatten() {
+            if root.exists() {
+                let subdirs = [
+                    root.join("lib").join("VC").join("x64").join("MD"),
+                    root.join("lib").join("VC").join("x64").join("MT"),
+                    root.join("lib").join("VC"),
+                    root.join("lib"),
+                    root.clone(),
+                ];
+                for dir in subdirs {
+                    let has_libssl = dir.join("libssl.lib").exists();
+                    let has_ssl = dir.join("ssl.lib").exists();
+                    let has_libcrypto = dir.join("libcrypto.lib").exists();
+                    let has_crypto = dir.join("crypto.lib").exists();
+
+                    if (has_libssl || has_ssl) && (has_libcrypto || has_crypto) {
+                        println!("cargo:rustc-link-search=native={}", dir.display());
+                        if has_libssl {
+                            println!("cargo:rustc-link-lib=libssl");
+                            println!("cargo:rustc-link-lib=libcrypto");
+                        } else {
+                            println!("cargo:rustc-link-lib=ssl");
+                            println!("cargo:rustc-link-lib=crypto");
+                        }
+                        linked_ssl = true;
+                        break;
+                    }
+                }
+                if linked_ssl {
+                    break;
+                }
+            }
+        }
     }
 }

@@ -1,0 +1,5 @@
+# Configuration for llama-cpp-sys-4 CMake build.
+# Disable OpenSSL to prevent unnecessary external TLS dependency;
+# llamad manages its own network protocols and does not use llama.cpp's internal HTTP client.
+[cmake]
+LLAMA_OPENSSL = "OFF"

@@ -91,6 +91,9 @@ opt-level = 2
 # crate's dependencies for the sake of docs.rs.
 no-default-features = true
 
+[package.metadata.llama-cpp-sys-4.cmake]
+LLAMA_OPENSSL = "OFF"
+
 [lints.rust]
 # Unsafe discipline, enforced by the compiler rather than by review. The crate
 # already complies — every `unsafe` operation sits in an explicit block, and
