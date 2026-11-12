@@ -133,13 +133,14 @@ fn client_completes_with_temperature() {
 
 #[serial]
 #[test]
-fn client_model_load_failure_surfaces_as_crash() {
-    // End-to-end: the inference thread fails to load the model, the
-    // preprocess thread exits, and the normal Client path reports the crash
-    // to the caller (not just a channel-level probe).
+fn client_model_load_failure_surfaces_as_model_load_error() {
+    // End-to-end: the inference thread fails to load the model, reports
+    // the failure reason via EngineReadiness, and the normal Client path
+    // surfaces ModelLoad rather than a generic crash.
     let client = Client::new("/nonexistent-model.gguf").expect("spawn should succeed");
     let err = client.complete(Request::new("x")).unwrap_err();
-    assert!(matches!(err, LlamaError::InferenceCrashed));
+    assert!(matches!(err, LlamaError::ModelLoad(_)));
+    assert!(matches!(client.wait_ready(), Err(LlamaError::ModelLoad(_))));
 }
 
 // ── Slot queuing (5 requests — 5th queued until a slot frees) ──
@@ -194,9 +195,9 @@ fn batch_overflow_streaming_queues_fifth() {
     });
 
     let mut bridges: Vec<mpsc::Receiver<Result<InferResult, LlamaError>>> = Vec::new();
-    let mut keepalive: Vec<tokio::sync::mpsc::UnboundedReceiver<String>> = Vec::new();
+    let mut keepalive: Vec<tokio::sync::mpsc::Receiver<String>> = Vec::new();
     for _ in 0..5 {
-        let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (token_tx, token_rx) = tokio::sync::mpsc::channel(64);
         keepalive.push(token_rx);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let bridge_rx = oneshot_bridge(done_rx);

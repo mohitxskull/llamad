@@ -95,11 +95,11 @@ does not add capacity; it cuts each request's prompt-plus-generation budget to
 issue concurrent requests.
 
 ```
-┌──────────────┐   mpsc::channel    ┌────────────────────┐   mpsc::channel    ┌─────────────────────────────┐
-│  your code   │ ─────────────────> │  preprocess thread │ ─────────────────> │  inference thread           │
-│  (sync/async)│                    │  chat template +   │  (pre-tokenized)   │  owns model + ctx + slots   │
-│              │ <oneshot::channel> │  tokenize + budget │                    │  continuous batching loop   │
-└──────────────┘                    └────────────────────┘                    └─────────────────────────────┘
+┌──────────────┐  sync_channel(max_q) ┌────────────────────┐ sync_channel(max_q) ┌─────────────────────────────┐
+│  your code   │ ───────────────────> │  preprocess thread │ ───────────────────> │  inference thread           │
+│  (sync/async)│                      │  chat template +   │   (pre-tokenized)    │  owns model + ctx + slots   │
+│              │  <oneshot::channel>  │  tokenize + budget │                      │  continuous batching loop   │
+└──────────────┘                      └────────────────────┘                      └─────────────────────────────┘
 ```
 
 Engines are independent: any number can be alive at once, each with its own
@@ -109,9 +109,17 @@ fully released. Teardown is bounded by one decode step even when every slot is
 busy — a shutdown flag is checked per loop iteration, not just when the command
 channel is drained.
 
+**Startup handshake & readiness**: Model and context initialization occur
+with an explicit readiness handshake via `Engine::wait_ready()` and
+`Engine::wait_ready_async()`. The daemon waits for readiness before accepting
+connections or binding sockets, exiting non-zero immediately if model loading
+fails.
+
 **Slot lifecycle**: `empty → prefill (prompt phase) → generate → finish/cancel → empty`. A slot finishes on end-of-generation, the token cap, the per-slot budget, or a stop sequence.
 - Each slot has a per-slot token budget (`N_CTX / N_SLOTS`, default 2048 — one slot holding all of `N_CTX`), configurable via `LLAMAD_N_CTX` / `LLAMAD_N_SLOTS`. A prompt that exceeds its slot's budget is rejected at preprocess time rather than truncated.
-- When all `LLAMAD_N_SLOTS` slots are full, new requests queue in the `mpsc` channel and are dequeued as slots free up.
+- When all `LLAMAD_N_SLOTS` slots are full, new requests wait in bounded command queues (`mpsc::sync_channel`, default capacity 64, configurable via `LLAMAD_MAX_QUEUE`). If queues are saturated, excess requests fail fast with `LlamaError::Busy`.
+- Streaming token channels are bounded (`tokio::sync::mpsc::channel(64)`). If a slow consumer receiver fills and cannot keep up, the slot is cancelled under the slow-consumer policy to prevent memory exhaustion and avoid blocking concurrent sequences.
+- Non-streaming requests propagate cancellation: dropping the response future drops its receiver, causing the inference worker to release the occupied slot promptly.
 - **Slot routing is prefix-aware**: an incoming request goes to the free slot whose retained KV prefix shares the most tokens with it, not simply to the lowest free index. Without this, a request arriving while slot 0 is busy would full-prefill on slot 1 even when an idle slot held an exact prefix of it — the common shape for a repeated system prompt. Ties resolve to the lowest free index.
 - KV cache is cleared per-sequence (`ctx.clear_kv_cache_seq`) on finish, cancel, and streaming client disconnect. When reuse is on (`LLAMAD_KV_CACHE=on` and the model supports partial KV rewind), a completed sequence's KV prefix is retained and reused on the next request into the same slot — but only while its length stayed within the per-slot budget; a sequence that hit the generation budget is fully cleared instead.
 
@@ -424,8 +432,26 @@ Streaming response (NDJSON):
 
 Errors (both modes):
 ```json
-{"error":"inference: ..."}
+{
+  "version": "1.0",
+  "error": "inference: all slots busy",
+  "error_detail": {
+    "code": "BUSY",
+    "message": "inference: all slots busy",
+    "retryable": true
+  }
+}
 ```
+
+The wire protocol supports `PROTOCOL_VERSION = "1.0"` with structured machine-readable error codes:
+- `MODEL_LOAD`: Model file missing, corrupted, or backend initialization failed (`retryable: false`).
+- `INFERENCE_CRASHED`: Inference worker thread crashed or engine dropped (`retryable: true`).
+- `BUSY`: All inference slots busy or command queue saturated (`retryable: true`).
+- `PROMPT_TOO_LONG`: Prompt tokens exceed available context budget (`retryable: false`).
+- `DISCONNECTED`: Client disconnected or cancelled request (`retryable: false`).
+- `INFERENCE_ERROR`: Decode error, detokenization failure, or batch overflow (`retryable: false`).
+- `PROTOCOL_ERROR`: Invalid JSON, zero max_tokens, invalid role/content, or grammar compilation error (`retryable: false`).
+- `IO_ERROR`: System I/O error (`retryable: false`).
 
 Other error forms: `invalid request` (parse failure or unknown field), `empty request`, `request too large`, `read timeout` (30 s to send a request), `stream timeout` (60 s without tokens), `inference thread unavailable`.
 
@@ -663,6 +689,8 @@ Environment variables (read once per engine at startup; unparsable values fall b
 |---|---|---|
 | `LLAMAD_N_SLOTS` | 1 | Concurrent sequences (clamped 1–512); KV context is split *statically and evenly* across slots, so raising this divides each request's budget rather than adding capacity — raise `LLAMAD_N_CTX` with it |
 | `LLAMAD_N_CTX` | 2048 | Total KV-context capacity in tokens, all slots (clamped to `n_slots`…1,048,576) |
+| `LLAMAD_MAX_QUEUE` | 64 | Maximum queued requests in command channels before backpressure triggers rejection with `LlamaError::Busy` (clamped 1–4096) |
+| `LLAMAD_MAX_CONNECTIONS` | 128 | Maximum concurrent client connections accepted by the daemon server (clamped 1–65536) |
 | `LLAMAD_N_THREADS` | physical cores | Threads for single-token decode (clamped 1–256) |
 | `LLAMAD_N_THREADS_BATCH` | physical cores | Threads for batched prompt processing, prefill (clamped 1–256) |
 | `LLAMAD_KV_CACHE` | on | Reuse the KV prefix of completed sequences on the next request into the same slot (runtime-probed; disabled on models that cannot partially rewind KV; retention capped at the per-slot budget — sequences at/over the budget are fully cleared) |
@@ -676,11 +704,10 @@ Environment variables (read once per engine at startup; unparsable values fall b
 
 ## Tests
 
-First fetch the model fixtures (re-runnable; skips already-downloaded files):
+First fetch the model fixture (re-runnable; skips already-downloaded and verified files):
 
 ```sh
-./models/download.sh                  # all three GGUFs (~950 MB)
-./models/download.sh SmolLM2          # just the KV-reuse test model
+./models/download.sh                  # LFM3-1.7B-Q4_K_M.gguf (~1.1 GB)
 ```
 
 Then:
@@ -688,37 +715,37 @@ Then:
 ```sh
 cargo test --features native          # all tests
 cargo test --lib                      # unit tests only (no model needed)
-cargo test --test integration         # real-model integration tests (LFM2.5)
+cargo test --test integration         # real-model integration tests (LFM3)
 cargo test --test lifecycle           # engine/client lifecycle contracts
 cargo test --test reuse               # KV-prefix-reuse path tests (attention model)
-cargo test --test cancellation        # slot-recycling cancellation test
+cargo test --test cancellation        # streaming & non-streaming slot cancellation
 cargo test --test daemon              # the llamad binary, end to end
 cargo test --test fixtures            # fixture/download.sh drift (no model needed)
 ```
 
-156 unit tests + 5 fixture-drift tests + 36 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 4 in `tests/daemon.rs`, 3 in `tests/reuse.rs`, 1 in `tests/cancellation.rs`) + 6 doc tests.
+161 unit tests + 5 fixture-drift tests + 38 real-model tests (21 in `tests/integration.rs`, 7 in `tests/lifecycle.rs`, 5 in `tests/daemon.rs`, 3 in `tests/reuse.rs`, 2 in `tests/cancellation.rs`) + 6 doc tests.
 
 Fixtures are named for the **capability** a test needs, not for a model's size: `HYBRID` (KV rewind unsupported — the degraded path), `HYBRID_LARGE`, and `ATTENTION` (rewind supported — reuse engages). Paths default under `CARGO_MANIFEST_DIR`; override with `LLAMAD_TEST_MODEL_HYBRID`, `LLAMAD_TEST_MODEL_HYBRID_LARGE`, or `LLAMAD_TEST_MODEL_ATTENTION`. Set `LLAMAD_REQUIRE_MODELS=1` — as CI does — to turn a missing fixture from a skip into a failure; without it a suite that tested nothing still reports as passing. `tests/fixtures.rs` checks the fixture list against `models/download.sh` in both directions, so a renamed quant and a download nothing uses are both caught. Every model-loading test is `#[serial]`-enforced (`serial_test`) within its binary, and cargo runs test binaries sequentially, so the heavy llama.cpp loads never contend — no `--test-threads` flags needed. Log-contract assertions (the "degrade loudly" warning, the reuse debug line) use a minimal capture `Layer` in `tests/common/mod.rs` (tracing-test was evaluated and rejected: its per-test subscriber filters to the test crate's targets, dropping library events).
 
 ### KV-reuse path (`LLAMAD_TEST_MODEL_ATTENTION` / bundled SmolLM2)
 
-The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages only when the startup probe finds a model that supports partial KV rewind — which the repo's LFM2.5 hybrids do not (they run the degraded full-prefill path). The reuse-path tests in `tests/reuse.rs` run against `LLAMAD_TEST_MODEL_ATTENTION` (any attention-only GGUF) when set, else the bundled SmolLM2-135M in `models/`. With a rewind-capable model the identical-resend and partial-prefix tests exercise the real reuse path, and a dedicated test asserts the probe verdict is `true` on it (no degradation warning; reuse debug lines present). Without one the binary skips — and skips report as passes, so CI sets `LLAMAD_REQUIRE_MODELS=1` to make that a failure instead. The degraded-path contract stays covered by `probe_verdict_degrades_loudly_on_lfm2` in `tests/integration.rs`.
+The KV-prefix-reuse machinery (anchor, retention, fill reconciliation) engages only when the startup probe finds a model that supports partial KV rewind — which hybrid models do not (they run the degraded full-prefill path). The reuse-path tests in `tests/reuse.rs` run against `LLAMAD_TEST_MODEL_ATTENTION` (any attention-only GGUF) when set, else SmolLM2-135M if present. With a rewind-capable model the identical-resend and partial-prefix tests exercise the real reuse path, and a dedicated test asserts the probe verdict is `true` on it (no degradation warning; reuse debug lines present). Without one the binary skips — and skips report as passes, so CI sets `LLAMAD_REQUIRE_MODELS=1` to make that a failure instead. The degraded-path contract stays covered by `probe_verdict_degrades_loudly_on_lfm2` in `tests/integration.rs`.
 
 ### Test coverage
 
 | Area | Tests | Description |
 |---|---|---|
-| Protocol | 20 | Deserialization, serialization round-trip, null-byte rejection, history, and the wire shape of `StreamDone` (flat, not nested) and `ErrorResponse` |
+| Protocol | 21 | Deserialization, serialization round-trip, null-byte rejection, history, wire shape of `StreamDone`, `ErrorResponse`, and structured `ErrorDetail` |
 | Preprocess | 29 | Chat templating (`build_messages`), sampling resolution and clamping, grammar validation, stop-sequence normalization, budget checks, defaults |
 | Slot lifecycle + KV reuse | 56 | finish, cancel, streaming disconnect, UTF-8 assembly, stop-sequence matching (split fragments, withheld partial matches, multi-byte boundaries), sampler chain and seeding, LCP, prefix-aware slot routing, `begin_request` mirror, `finish_prefill` invariant, probe verdict gating, fallback. Includes 5 **property** tests (proptest) over UTF-8 reassembly, stop-sequence hold-back and prefix matching — the areas where hand-picked examples only cover the cases someone thought of |
-| Client API | 15 | complete/complete_stream, async variants, error propagation, done-signal ordering, `Send + Sync` guard |
-| Server | 18 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, newline-framed request with no half-close (the mechanism Windows needs), size cap, error responses. A `cfg(windows)` module mirrors the protocol assertions over a named pipe; those run on the `windows-latest` CI job, not locally. |
-| Config | 18 | Env parsing, defaults, `sane()` clamping, true-spelling parsing (via `read_env_bool` directly — through `from_env` the property is untestable, since its default is already `true`), and the physical-core thread default |
-| Integration | 21 | Real model (LFM2.5): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility, grammar constraint (sampled + greedy + JSON) and rejection of malformed/null-byte/unknown-root grammars without killing the engine |
+| Client API | 18 | complete/complete_stream, async variants, wait_ready, status, error propagation, done-signal ordering, `Send + Sync` guard |
+| Server | 18 | Socket binding and permissions, stale/live-socket handling, JSON round-trips, newline-framed request with no half-close (the mechanism Windows needs), size cap, structured error responses. A `cfg(windows)` module mirrors the protocol assertions over a named pipe; those run on the `windows-latest` CI job, not locally. |
+| Config | 19 | Env parsing, defaults, `sane()` clamping, queue bounds, true-spelling parsing (via `read_env_bool` directly — through `from_env` the property is untestable, since its default is already `true`), and the physical-core thread default |
+| Integration | 21 | Real model (LFM3): simple completion, streaming, multi-turn, batching, 5-request overflow, probe verdict (degrade loudly), stop-sequence truncation (buffered + streamed), unseeded variation and seeded reproducibility, grammar constraint (sampled + greedy + JSON) and rejection of malformed/null-byte/unknown-root grammars without killing the engine |
 | Lifecycle | 7 | Real model: two models side by side with independent configs, degenerate-config clamping, two concurrent clients, simultaneous engine startup (backend-init race), prompt shutdown under load, explicit shutdown, async API inside a tokio runtime |
 | KV reuse e2e | 3 | Real model (attention, `tests/reuse.rs`): identical resend, partial-prefix triple, reuse-engages probe verdict |
-| Cancellation | 1 | Single-slot server: slot recycled after stream drop (bounded first-token wait) |
-| Daemon binary | 4 | The real `llamad` binary via `CARGO_BIN_EXE_llamad`: socket mode `0600`, newline-framed request round-trip, NDJSON stream terminated by a done line, SIGINT exits zero and unlinks the socket, usage/`--help` exit codes |
+| Cancellation | 2 | Single-slot server: non-streaming and streaming slot recycling after receiver drop (prompt release of busy slots) |
+| Daemon binary | 5 | The real `llamad` binary via `CARGO_BIN_EXE_llamad`: startup readiness failure exit code, socket mode `0600`, newline-framed request round-trip, NDJSON stream terminated by a done line, SIGINT exits zero and unlinks the socket, usage/`--help` exit codes |
 | Fixture drift | 5 | No model needed: the fixture list and `models/download.sh` must name the same files in *both* directions — a renamed quant and a download nothing uses are both failures |
 
 ### Test architecture

@@ -35,6 +35,8 @@ pub struct InferenceConfig {
     /// Keep the KV cache of completed sequences and reuse the shared
     /// token prefix on the next request into the same slot.
     pub kv_cache: bool,
+    /// Maximum queued requests waiting for admission before rejecting with [`LlamaError::Busy`](crate::protocol::LlamaError::Busy).
+    pub max_queue: usize,
 }
 
 impl Default for InferenceConfig {
@@ -45,6 +47,7 @@ impl Default for InferenceConfig {
             n_threads: 0,
             n_threads_batch: 0,
             kv_cache: true,
+            max_queue: 64,
         }
         .with_default_threads()
     }
@@ -102,6 +105,7 @@ impl InferenceConfig {
             n_threads: read_env("LLAMAD_N_THREADS", base.n_threads),
             n_threads_batch: read_env("LLAMAD_N_THREADS_BATCH", base.n_threads_batch),
             kv_cache: read_env_bool("LLAMAD_KV_CACHE", base.kv_cache),
+            max_queue: read_env("LLAMAD_MAX_QUEUE", base.max_queue),
         }
         .sane()
     }
@@ -125,6 +129,7 @@ impl InferenceConfig {
             n_threads: self.n_threads.clamp(1, 256),
             n_threads_batch: self.n_threads_batch.clamp(1, 256),
             kv_cache: self.kv_cache,
+            max_queue: self.max_queue.clamp(1, 4096),
         }
     }
 
@@ -295,6 +300,7 @@ mod tests {
             n_threads: 2,
             n_threads_batch: 2,
             kv_cache: true,
+            max_queue: 64,
         };
         assert_eq!(cfg.per_slot_budget(), 333);
     }
@@ -358,6 +364,7 @@ mod tests {
                 n_threads: 1,
                 n_threads_batch: 1,
                 kv_cache: true,
+                max_queue: 64,
             }
             .sane();
             assert!(
@@ -378,6 +385,7 @@ mod tests {
             n_threads: 1,
             n_threads_batch: 1,
             kv_cache: true,
+            max_queue: 64,
         }
         .sane();
         assert_eq!(cfg.n_ctx, 64);

@@ -195,29 +195,41 @@ pub(crate) fn prepare_request(
 }
 
 /// Hand a prepared command to the inference thread, reporting the failure to
-/// the request's own channels if that thread has already exited.
-///
-/// `SendError` gives the whole command back, which is what makes this
-/// uniform: rather than each call site matching on the variant it just sent
-/// (and needing an `unreachable!` for the ones it cannot have sent), the
-/// returned command is destructured once, here.
-fn forward(prepared_tx: &mpsc::Sender<PreparedCmd>, cmd: PreparedCmd) {
-    let Err(mpsc::SendError(returned)) = prepared_tx.send(cmd) else {
-        return;
-    };
-    match returned {
-        PreparedCmd::Run { resp, .. } => {
-            let _ = resp.send(Err(LlamaError::InferenceCrashed));
-        }
-        PreparedCmd::RunStream {
-            token_tx, done_tx, ..
-        } => {
-            if let Some(done) = done_tx {
-                let _ = done.send(Err(LlamaError::InferenceCrashed));
+/// the request's own channels if that thread is full or has already exited.
+fn forward(prepared_tx: &mpsc::SyncSender<PreparedCmd>, cmd: PreparedCmd) {
+    match prepared_tx.try_send(cmd) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(returned)) => {
+            tracing::warn!("inference queue full, rejecting request with Busy");
+            match returned {
+                PreparedCmd::Run { resp, .. } => {
+                    let _ = resp.send(Err(LlamaError::Busy));
+                }
+                PreparedCmd::RunStream {
+                    token_tx, done_tx, ..
+                } => {
+                    if let Some(done) = done_tx {
+                        let _ = done.send(Err(LlamaError::Busy));
+                    }
+                    drop(token_tx);
+                }
+                PreparedCmd::Shutdown => {}
             }
-            drop(token_tx);
         }
-        PreparedCmd::Shutdown => {}
+        Err(mpsc::TrySendError::Disconnected(returned)) => match returned {
+            PreparedCmd::Run { resp, .. } => {
+                let _ = resp.send(Err(LlamaError::InferenceCrashed));
+            }
+            PreparedCmd::RunStream {
+                token_tx, done_tx, ..
+            } => {
+                if let Some(done) = done_tx {
+                    let _ = done.send(Err(LlamaError::InferenceCrashed));
+                }
+                drop(token_tx);
+            }
+            PreparedCmd::Shutdown => {}
+        },
     }
 }
 
@@ -226,7 +238,7 @@ fn forward(prepared_tx: &mpsc::Sender<PreparedCmd>, cmd: PreparedCmd) {
 pub(super) fn preprocess_loop(
     cmd_rx: mpsc::Receiver<InferCmd>,
     model_rx: mpsc::Receiver<Arc<LlamaModel>>,
-    prepared_tx: mpsc::Sender<PreparedCmd>,
+    prepared_tx: mpsc::SyncSender<PreparedCmd>,
     config: InferenceConfig,
 ) {
     let model = match model_rx.recv() {
@@ -360,7 +372,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (model_tx, model_rx) = mpsc::channel();
         drop(model_tx); // dropped immediately, as when the inference thread dies
-        let (prepared_tx, _prepared_rx) = mpsc::channel();
+        let (prepared_tx, _prepared_rx) = mpsc::sync_channel(64);
         let cfg = InferenceConfig::default();
         let handle = std::thread::spawn(move || {
             preprocess_loop(cmd_rx, model_rx, prepared_tx, cfg);

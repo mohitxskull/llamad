@@ -26,7 +26,7 @@ fn drop_token_stream_cancels_inference() {
     // First request: a long generation. Receive one token to confirm it is
     // mid-flight, then drop the receiver — the inference thread's next emit
     // fails and the slot is cancelled.
-    let (token_tx1, mut token_rx1) = tokio::sync::mpsc::unbounded_channel();
+    let (token_tx1, mut token_rx1) = tokio::sync::mpsc::channel(64);
     engine
         .send(InferCmd::RunStream {
             request: Request::new("write a long story about a dragon").with_max_tokens(5000),
@@ -45,7 +45,7 @@ fn drop_token_stream_cancels_inference() {
     // first request's remaining generation budget (~2048+ tokens). With a
     // cancel-does-nothing regression the second request queues behind that
     // remaining budget and produces no token within the bound.
-    let (token_tx2, mut token_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let (token_tx2, mut token_rx2) = tokio::sync::mpsc::channel(64);
     let (done_tx2, done_rx2) = tokio::sync::oneshot::channel();
     engine
         .send(InferCmd::RunStream {
@@ -115,7 +115,7 @@ fn drop_non_streaming_receiver_cancels_inference() {
 /// (tokio's unbounded receiver has no `blocking_recv_timeout`, so poll with
 /// a hard deadline.)
 fn poll_first_token(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
     timeout: Duration,
 ) -> Option<String> {
     let deadline = std::time::Instant::now() + timeout;

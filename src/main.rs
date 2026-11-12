@@ -3,8 +3,10 @@
 //! Unix domain socket on Unix, named pipe on Windows. The wire protocol is
 //! identical; only the listener and the accept loop differ.
 
+use std::sync::Arc;
+
 use llamad::inference::Engine;
-use llamad::server::{DEFAULT_SOCKET_PATH, handle_connection};
+use llamad::server::{DEFAULT_SOCKET_PATH, handle_connection, reply_error};
 
 #[cfg(windows)]
 use llamad::server::bind_pipe;
@@ -83,14 +85,23 @@ async fn main() -> anyhow::Result<()> {
         .map_or(DEFAULT_SOCKET_PATH, |s| s.as_str())
         .to_owned();
 
+    tracing::info!("Loading model from {model_path}...");
+    let engine = Engine::start(model_path)?;
+    engine.wait_ready_async().await?;
+    tracing::info!("Model loaded successfully");
+
     #[cfg(unix)]
     let mut acceptor = bind_socket(&socket_path)?;
     #[cfg(windows)]
     let mut acceptor = bind_pipe(&socket_path, true)?;
 
-    let engine = Engine::start(model_path)?;
-
     tracing::info!("llamad listening on {socket_path}");
+
+    let max_connections = std::env::var("LLAMAD_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128);
+    let connection_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
 
     loop {
         tokio::select! {
@@ -100,8 +111,21 @@ async fn main() -> anyhow::Result<()> {
             }
             result = accept(&mut acceptor, &socket_path) => {
                 let mut stream = result?;
+                let permit = match connection_limit.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(
+                            "Max concurrent connections ({max_connections}) reached; rejecting connection"
+                        );
+                        tokio::spawn(async move {
+                            reply_error(&mut stream, "server busy: max concurrent connections reached").await;
+                        });
+                        continue;
+                    }
+                };
                 let cmd_tx = engine.sender().clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     handle_connection(&mut stream, &cmd_tx).await;
                 });
             }

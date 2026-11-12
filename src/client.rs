@@ -5,7 +5,7 @@ use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::InferenceConfig;
-use crate::inference::Engine;
+use crate::inference::{Engine, EngineStatus};
 use crate::protocol::{InferCmd, InferResult, LlamaError, Request};
 
 /// High-level client for a local GGUF model.
@@ -141,9 +141,13 @@ impl Client {
     /// Whatever ended the request — see [`LlamaError`].
     pub fn complete(&self, request: Request) -> Result<InferResult, LlamaError> {
         let resp_rx = self.submit(request)?;
-        resp_rx
-            .blocking_recv()
-            .map_err(|_| LlamaError::InferenceCrashed)?
+        resp_rx.blocking_recv().map_err(|_| {
+            if let EngineStatus::Failed(reason) = self.engine.status() {
+                LlamaError::ModelLoad(reason)
+            } else {
+                LlamaError::InferenceCrashed
+            }
+        })?
     }
 
     /// Run non-streaming inference without blocking the calling thread.
@@ -153,7 +157,13 @@ impl Client {
     /// Whatever ended the request — see [`LlamaError`].
     pub async fn complete_async(&self, request: Request) -> Result<InferResult, LlamaError> {
         let resp_rx = self.submit(request)?;
-        resp_rx.await.map_err(|_| LlamaError::InferenceCrashed)?
+        resp_rx.await.map_err(|_| {
+            if let EngineStatus::Failed(reason) = self.engine.status() {
+                LlamaError::ModelLoad(reason)
+            } else {
+                LlamaError::InferenceCrashed
+            }
+        })?
     }
 
     /// Non-streaming completion from a prompt string.
@@ -188,9 +198,11 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`LlamaError::InferenceCrashed`] if the engine's threads have exited.
+    /// - [`LlamaError::Busy`] if the engine's command queue is full.
+    /// - [`LlamaError::ModelLoad`] if model loading failed.
+    /// - [`LlamaError::InferenceCrashed`] if the engine's threads have exited.
     pub fn complete_stream(&self, request: Request) -> Result<TokenStream, LlamaError> {
-        let (token_tx, token_rx) = mpsc::unbounded_channel();
+        let (token_tx, token_rx) = mpsc::channel(64);
         let (done_tx, done_rx) = oneshot::channel();
         self.engine.send(InferCmd::RunStream {
             request,
@@ -202,6 +214,22 @@ impl Client {
             done_rx,
             text: String::new(),
         })
+    }
+
+    /// Block until the model is loaded and ready to serve requests.
+    pub fn wait_ready(&self) -> Result<(), LlamaError> {
+        self.engine.wait_ready()
+    }
+
+    /// Await until the model is loaded and ready to serve requests.
+    pub async fn wait_ready_async(&self) -> Result<(), LlamaError> {
+        self.engine.wait_ready_async().await
+    }
+
+    /// The current lifecycle status of the engine.
+    #[must_use]
+    pub fn status(&self) -> EngineStatus {
+        self.engine.status()
     }
 
     /// The underlying engine, for direct [`InferCmd`] submission.
@@ -234,7 +262,7 @@ impl Client {
 /// [`into_result_async`](Self::into_result_async) there.
 #[derive(Debug)]
 pub struct TokenStream {
-    rx: mpsc::UnboundedReceiver<String>,
+    rx: mpsc::Receiver<String>,
     /// Not optional: `complete_stream` is the only constructor and always
     /// requests a done-channel. `InferCmd::RunStream` allows `done_tx: None`
     /// for a caller driving the engine directly, but a `TokenStream` never
@@ -330,14 +358,14 @@ mod tests {
     /// ordering `into_result` depends on. A `try_recv` here would race.
     #[test]
     fn test_into_result_gets_stats_when_tokens_close_first() {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
         std::thread::spawn(move || {
             for cmd in cmd_rx {
                 if let InferCmd::RunStream {
                     token_tx, done_tx, ..
                 } = cmd
                 {
-                    let _ = token_tx.send("hi".to_string());
+                    let _ = token_tx.blocking_send("hi".to_string());
                     if let Some(done) = done_tx {
                         let _ = done.send(Ok(InferResult {
                             text: "hi".into(),
@@ -363,7 +391,7 @@ mod tests {
     /// reported as such rather than as a generic "no done signal".
     #[test]
     fn test_into_result_reports_crash_when_done_dropped() {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
         std::thread::spawn(move || {
             for cmd in cmd_rx {
                 if let InferCmd::RunStream {
@@ -446,7 +474,7 @@ mod tests {
     /// A client whose "inference thread" echoes the prompt back, so the
     /// client API can be exercised without loading a model.
     fn mock_client() -> Client {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
         std::thread::spawn(move || {
             for cmd in cmd_rx {
                 match cmd {
@@ -464,7 +492,7 @@ mod tests {
                         done_tx,
                     } => {
                         for ch in request.prompt.chars() {
-                            let _ = token_tx.send(ch.to_string());
+                            let _ = token_tx.blocking_send(ch.to_string());
                         }
                         if let Some(done) = done_tx {
                             let _ = done.send(Ok(InferResult {
@@ -482,7 +510,7 @@ mod tests {
         client_from_sender(cmd_tx)
     }
 
-    fn client_from_sender(cmd_tx: mpsc::Sender<InferCmd>) -> Client {
+    fn client_from_sender(cmd_tx: mpsc::SyncSender<InferCmd>) -> Client {
         Client {
             engine: Engine::from_sender(cmd_tx),
         }
@@ -540,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_complete_inference_thread_crashed() {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
         drop(cmd_rx);
         let client = client_from_sender(cmd_tx);
         let err = client.complete(Request::new("x")).unwrap_err();
@@ -549,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_complete_stream_inference_thread_crashed() {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
         drop(cmd_rx);
         let client = client_from_sender(cmd_tx);
         let err = client.complete_stream(Request::new("x")).unwrap_err();
@@ -558,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_complete_stream_error_through_done_tx() {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(64);
         std::thread::spawn(move || {
             for cmd in cmd_rx {
                 if let InferCmd::RunStream { done_tx, .. } = cmd {

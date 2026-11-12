@@ -7,9 +7,9 @@
 use std::ffi::CStr;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use llama_cpp_4::prelude::*;
@@ -52,6 +52,8 @@ enum Emit {
     Stopped,
     /// The streaming client hung up.
     Disconnected,
+    /// The streaming buffer is full and the slow consumer was dropped.
+    SlowConsumer,
 }
 
 struct Slot {
@@ -66,7 +68,7 @@ struct Slot {
     pending_token: Option<LlamaToken>,
     prompt_phase: bool,
     resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
-    token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    token_tx: Option<tokio::sync::mpsc::Sender<String>>,
     done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
     cache_tokens: Vec<LlamaToken>,
     /// Stop sequences, already stripped of empty entries by preprocessing.
@@ -164,19 +166,25 @@ impl Slot {
     }
 
     /// Stream `text[emitted..end]` to a streaming client, advancing `emitted`.
-    /// Returns `false` when that client has disconnected.
-    fn flush_to(&mut self, end: usize) -> bool {
+    /// Returns [`Emit`] indicating whether the stream continues, disconnected, or dropped as a slow consumer.
+    fn flush_to(&mut self, end: usize) -> Emit {
         if end <= self.emitted {
-            return true;
+            return Emit::Continue;
         }
         let chunk = self.text[self.emitted..end].to_owned();
         self.emitted = end;
-        if let Some(ref tx) = self.token_tx
-            && tx.send(chunk).is_err()
-        {
-            return false;
+        if let Some(ref tx) = self.token_tx {
+            match tx.try_send(chunk) {
+                Ok(()) => Emit::Continue,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Emit::Disconnected,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("streaming token receiver full: slow consumer cancelled");
+                    Emit::SlowConsumer
+                }
+            }
+        } else {
+            Emit::Continue
         }
-        true
     }
 
     /// Accumulate a generated fragment and release whatever is now safe to
@@ -196,17 +204,14 @@ impl Slot {
             // on was withheld by `holdback` as a growing prefix of this very
             // match, and `flush_to` no-ops if that were ever violated.
             self.text.truncate(cut);
-            if !self.flush_to(cut) {
-                return Emit::Disconnected;
-            }
-            return Emit::Stopped;
+            return match self.flush_to(cut) {
+                Emit::Continue => Emit::Stopped,
+                other => other,
+            };
         }
 
         let safe = self.text.len() - self.holdback();
-        if !self.flush_to(safe) {
-            return Emit::Disconnected;
-        }
-        Emit::Continue
+        self.flush_to(safe)
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -221,7 +226,15 @@ impl Slot {
         // Release anything still withheld for a possible stop match:
         // generation ended without one, so the tail is ordinary output.
         let end = self.text.len();
-        let _ = self.flush_to(end);
+        match self.flush_to(end) {
+            Emit::Disconnected => return Err(LlamaError::Disconnected),
+            Emit::SlowConsumer => {
+                return Err(LlamaError::Inference(
+                    "slow consumer: token channel buffer full".into(),
+                ));
+            }
+            _ => {}
+        }
         let result = InferResult {
             text: std::mem::take(&mut self.text),
             prompt_tokens: self.n_prompt,
@@ -465,7 +478,7 @@ fn build_sampler(
 #[derive(Default)]
 struct Channels {
     resp: Option<tokio::sync::oneshot::Sender<Result<InferResult>>>,
-    token_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    token_tx: Option<tokio::sync::mpsc::Sender<String>>,
     done_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<InferResult, LlamaError>>>,
 }
 
@@ -700,11 +713,14 @@ fn inference_loop(
     model_tx: mpsc::Sender<Arc<LlamaModel>>,
     config: InferenceConfig,
     shutdown: Arc<AtomicBool>,
+    readiness: EngineReadiness,
 ) {
     let backend = match get_backend() {
         Ok(b) => b,
         Err(e) => {
-            tracing::error!("{e}");
+            let msg = format!("{e}");
+            tracing::error!("{msg}");
+            readiness.set_failed(msg);
             return;
         }
     };
@@ -744,18 +760,43 @@ fn inference_loop(
         llama_cpp_4::log_set(Some(log_callback), std::ptr::null_mut());
     }
 
+    if !model_path.exists() {
+        let msg = format!("model file does not exist: {}", model_path.display());
+        tracing::error!("{msg}");
+        readiness.set_failed(msg);
+        return;
+    }
+
     let model_params = std::pin::pin!(LlamaModelParams::default().with_use_mlock(false));
-    let model = match LlamaModel::load_from_file(backend, model_path, &model_params) {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            tracing::error!("Failed to load model: {e}");
+    let model = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        LlamaModel::load_from_file(backend, model_path, &model_params)
+    })) {
+        Ok(Ok(m)) => Arc::new(m),
+        Ok(Err(e)) => {
+            let msg = format!("Failed to load model: {e}");
+            tracing::error!("{msg}");
+            readiness.set_failed(msg);
+            return;
+        }
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                format!("Failed to load model: {s}")
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                format!("Failed to load model: {s}")
+            } else {
+                "Failed to load model: panic during model loading".to_string()
+            };
+            tracing::error!("{msg}");
+            readiness.set_failed(msg);
             return;
         }
     };
     // Hand the model to the preprocess thread; it only calls pure &self
     // methods (chat template, tokenize), which are safe concurrently.
     if model_tx.send(Arc::clone(&model)).is_err() {
-        tracing::error!("Preprocess thread exited before model was ready");
+        let msg = "Preprocess thread exited before model was ready".to_string();
+        tracing::error!("{msg}");
+        readiness.set_failed(msg);
         return;
     }
 
@@ -788,7 +829,9 @@ fn inference_loop(
     let mut ctx = match model.new_context(backend, ctx_params) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("Failed to create context: {e}");
+            let msg = format!("Failed to create context: {e}");
+            tracing::error!("{msg}");
+            readiness.set_failed(msg);
             return;
         }
     };
@@ -798,6 +841,7 @@ fn inference_loop(
             "KV prefix reuse disabled: partial KV rewind unsupported by this model; full prefill per request"
         );
     }
+    readiness.set_ready();
     let mut sched = Scheduler {
         model: &model,
         ctx,
@@ -1270,6 +1314,16 @@ impl Scheduler<'_> {
                         self.abandon(&mut slot, seq_id, LlamaError::Disconnected);
                         continue;
                     }
+                    Emit::SlowConsumer => {
+                        self.abandon(
+                            &mut slot,
+                            seq_id,
+                            LlamaError::Inference(
+                                "streaming token consumer too slow (buffer full)".into(),
+                            ),
+                        );
+                        continue;
+                    }
                 },
                 Ok(None) => {}
                 Err(e) => {
@@ -1299,6 +1353,103 @@ impl Scheduler<'_> {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// The lifecycle status of an inference engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineStatus {
+    /// The model is loading and initializing in the background.
+    Loading,
+    /// The model and inference context are initialized and ready to serve requests.
+    Ready,
+    /// The model failed to load or initialize.
+    Failed(String),
+}
+
+#[derive(Clone)]
+pub(crate) struct EngineReadiness {
+    state: Arc<(Mutex<EngineStatus>, Condvar)>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl std::fmt::Debug for EngineReadiness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineReadiness")
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+impl EngineReadiness {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(EngineStatus::Loading), Condvar::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) fn status(&self) -> EngineStatus {
+        let (lock, _) = &*self.state;
+        let guard = match lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.clone()
+    }
+
+    pub(crate) fn set_ready(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = EngineStatus::Ready;
+        cvar.notify_all();
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn set_failed(&self, reason: String) {
+        let (lock, cvar) = &*self.state;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = EngineStatus::Failed(reason);
+        cvar.notify_all();
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn wait_ready(&self) -> Result<()> {
+        let (lock, cvar) = &*self.state;
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        loop {
+            match &*guard {
+                EngineStatus::Ready => return Ok(()),
+                EngineStatus::Failed(reason) => return Err(LlamaError::ModelLoad(reason.clone())),
+                EngineStatus::Loading => {
+                    guard = match cvar.wait(guard) {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn wait_ready_async(&self) -> Result<()> {
+        loop {
+            match self.status() {
+                EngineStatus::Ready => return Ok(()),
+                EngineStatus::Failed(reason) => return Err(LlamaError::ModelLoad(reason)),
+                EngineStatus::Loading => {
+                    self.notify.notified().await;
+                }
+            }
+        }
+    }
+}
+
 /// A loaded model and the two threads that serve it.
 ///
 /// The engine owns its `llamad-inference` and `llamad-preprocess` threads and
@@ -1324,18 +1475,20 @@ impl Scheduler<'_> {
 /// ```
 #[derive(Debug)]
 pub struct Engine {
-    cmd_tx: Option<mpsc::Sender<InferCmd>>,
+    cmd_tx: Option<mpsc::SyncSender<InferCmd>>,
     shutdown: Arc<AtomicBool>,
     inference: Option<thread::JoinHandle<()>>,
     preprocess: Option<thread::JoinHandle<()>>,
+    readiness: EngineReadiness,
 }
 
 impl Engine {
     /// Load `model_path` and start the inference and preprocess threads.
     ///
     /// Returns as soon as the threads are spawned — the model loads in the
-    /// background. A load failure is not reported here; it surfaces as
-    /// [`LlamaError::InferenceCrashed`] on the first request.
+    /// background. A load failure surfaces via [`wait_ready`](Self::wait_ready),
+    /// [`wait_ready_async`](Self::wait_ready_async), or on the first request as
+    /// [`LlamaError::ModelLoad`].
     ///
     /// # Errors
     ///
@@ -1391,9 +1544,12 @@ impl Engine {
 
         // client → preprocess (raw requests), preprocess → inference (prepared),
         // inference → preprocess (Arc<LlamaModel> once loaded).
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(config.max_queue);
+        let (prepared_tx, prepared_rx) = mpsc::sync_channel(config.max_queue);
         let (model_tx, model_rx) = mpsc::channel();
+
+        let readiness = EngineReadiness::new();
+        let infer_readiness = readiness.clone();
 
         let path = model_path.as_ref().to_owned();
         let infer_config = config.clone();
@@ -1402,7 +1558,14 @@ impl Engine {
         let inference = thread::Builder::new()
             .name("llamad-inference".into())
             .spawn(move || {
-                inference_loop(&path, prepared_rx, model_tx, infer_config, infer_shutdown)
+                inference_loop(
+                    &path,
+                    prepared_rx,
+                    model_tx,
+                    infer_config,
+                    infer_shutdown,
+                    infer_readiness,
+                )
             })
             .map_err(LlamaError::Io)?;
 
@@ -1416,6 +1579,7 @@ impl Engine {
             shutdown,
             inference: Some(inference),
             preprocess: Some(preprocess),
+            readiness,
         })
     }
 
@@ -1433,19 +1597,45 @@ impl Engine {
         clippy::expect_used,
         reason = "unreachable: `cmd_tx` is only taken by `stop`, which runs behind `shutdown(self)` or `drop`"
     )]
-    pub fn sender(&self) -> &mpsc::Sender<InferCmd> {
+    pub fn sender(&self) -> &mpsc::SyncSender<InferCmd> {
         self.cmd_tx.as_ref().expect("sender taken only on shutdown")
     }
 
-    /// Submit a command.
+    /// Submit a command to the bounded preprocessing queue.
     ///
     /// # Errors
     ///
-    /// [`LlamaError::InferenceCrashed`] if the preprocess thread has exited.
+    /// - [`LlamaError::Busy`] if the pending command queue is full.
+    /// - [`LlamaError::ModelLoad`] if model loading failed during startup.
+    /// - [`LlamaError::InferenceCrashed`] if the engine threads have exited.
     pub fn send(&self, cmd: InferCmd) -> Result<()> {
-        self.sender()
-            .send(cmd)
-            .map_err(|_| LlamaError::InferenceCrashed)
+        match self.sender().try_send(cmd) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(LlamaError::Busy),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                if let EngineStatus::Failed(reason) = self.readiness.status() {
+                    Err(LlamaError::ModelLoad(reason))
+                } else {
+                    Err(LlamaError::InferenceCrashed)
+                }
+            }
+        }
+    }
+
+    /// The current lifecycle status of the engine.
+    #[must_use]
+    pub fn status(&self) -> EngineStatus {
+        self.readiness.status()
+    }
+
+    /// Block until the model is loaded and ready, or return an error if startup failed.
+    pub fn wait_ready(&self) -> Result<()> {
+        self.readiness.wait_ready()
+    }
+
+    /// Await until the model is loaded and ready, or return an error if startup failed.
+    pub async fn wait_ready_async(&self) -> Result<()> {
+        self.readiness.wait_ready_async().await
     }
 
     /// Cancel every in-flight request and join both threads.
@@ -1460,12 +1650,15 @@ impl Engine {
     /// An engine backed by a caller-driven channel instead of real threads,
     /// so the client API can be tested without loading a model.
     #[cfg(test)]
-    pub(crate) fn from_sender(cmd_tx: mpsc::Sender<InferCmd>) -> Self {
+    pub(crate) fn from_sender(cmd_tx: mpsc::SyncSender<InferCmd>) -> Self {
+        let readiness = EngineReadiness::new();
+        readiness.set_ready();
         Engine {
             cmd_tx: Some(cmd_tx),
             shutdown: Arc::new(AtomicBool::new(false)),
             inference: None,
             preprocess: None,
+            readiness,
         }
     }
 
@@ -1549,7 +1742,7 @@ mod tests {
     }
 
     /// A slot that streams to `tx` and stops on `stop`.
-    fn streaming_slot(tx: tokio::sync::mpsc::UnboundedSender<String>, stop: &[&str]) -> Slot {
+    fn streaming_slot(tx: tokio::sync::mpsc::Sender<String>, stop: &[&str]) -> Slot {
         let stop: Vec<String> = stop.iter().map(|s| (*s).to_owned()).collect();
         Slot {
             token_tx: Some(tx),
@@ -1560,7 +1753,7 @@ mod tests {
     }
 
     /// Drain everything currently queued on a token receiver.
-    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<String>) -> String {
         let mut out = String::new();
         while let Ok(chunk) = rx.try_recv() {
             out.push_str(&chunk);
@@ -1570,7 +1763,7 @@ mod tests {
 
     #[test]
     fn test_slot_push_text_streams_and_accumulates() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &[]);
         assert_eq!(slot.push_text("hello"), Emit::Continue);
         assert_eq!(slot.text, "hello");
@@ -1714,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_slot_push_text_reports_disconnect() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         drop(rx);
         let mut slot = streaming_slot(tx, &[]);
         assert_eq!(slot.push_text("lost"), Emit::Disconnected);
@@ -1818,7 +2011,7 @@ mod tests {
 
     #[test]
     fn test_stop_sequence_within_a_single_fragment() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["STOP"]);
         assert_eq!(slot.push_text("abcSTOPdef"), Emit::Stopped);
         // The stop text and everything after it is dropped from the result.
@@ -1830,7 +2023,7 @@ mod tests {
     fn test_stop_sequence_split_across_fragments() {
         // The case a per-token check cannot catch: no single fragment
         // contains the stop sequence, only their concatenation does.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["<|end|>"]);
         assert_eq!(slot.push_text("hello <|"), Emit::Continue);
         assert_eq!(slot.push_text("end"), Emit::Continue);
@@ -1844,7 +2037,7 @@ mod tests {
         // "<|" looks like the start of the stop sequence, so it must not be
         // streamed. When the next fragment rules the match out, the withheld
         // bytes are released — losing them would silently truncate output.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["<|end|>"]);
         assert_eq!(slot.push_text("hi <|"), Emit::Continue);
         assert_eq!(drain(&mut rx), "hi ", "the ambiguous tail must be held");
@@ -1856,7 +2049,7 @@ mod tests {
     #[test]
     fn test_no_stop_sequences_withholds_nothing() {
         // The default path must not pay any streaming latency.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &[]);
         slot.push_text("anything at all");
         assert_eq!(drain(&mut rx), "anything at all");
@@ -1867,7 +2060,7 @@ mod tests {
     fn test_unrelated_text_is_not_withheld_despite_stop_sequences() {
         // Hold-back is computed from the actual tail, not from stop_max_len,
         // so output that looks nothing like a stop streams immediately.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["<|end|>"]);
         slot.push_text("plain prose");
         assert_eq!(drain(&mut rx), "plain prose");
@@ -1875,7 +2068,7 @@ mod tests {
 
     #[test]
     fn test_earliest_of_several_stop_sequences_wins() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["END", "XY"]);
         assert_eq!(slot.push_text("aXYbENDc"), Emit::Stopped);
         // "XY" occurs before "END": the cut is the earliest match, not the
@@ -1885,7 +2078,7 @@ mod tests {
 
     #[test]
     fn test_stop_sequence_at_the_very_start_yields_empty_text() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["STOP"]);
         assert_eq!(slot.push_text("STOP"), Emit::Stopped);
         assert_eq!(slot.text, "");
@@ -1895,7 +2088,7 @@ mod tests {
     fn test_stop_matching_across_multibyte_characters() {
         // Hold-back offsets are byte counts; landing mid-character would panic
         // on the `str` slice. "é" is two bytes, so the naive offset is unsafe.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["éé"]);
         assert_eq!(slot.push_text("café"), Emit::Continue);
         assert_eq!(slot.push_text("é!"), Emit::Stopped);
@@ -1907,7 +2100,7 @@ mod tests {
     fn test_multibyte_tail_is_not_split_when_withheld() {
         // A withheld tail must stay on a char boundary even when the stop
         // sequence is multi-byte and only partially matched.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut slot = streaming_slot(tx, &["→→"]);
         assert_eq!(slot.push_text("go →"), Emit::Continue);
         assert_eq!(drain(&mut rx), "go ");
@@ -1919,7 +2112,7 @@ mod tests {
     fn test_finish_releases_withheld_tail() {
         // Generation ending on EOG or the token cap while a partial stop match
         // is outstanding must still deliver those bytes.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let mut slot = Slot {
             done_tx: Some(done_tx),
@@ -2398,7 +2591,7 @@ mod tests {
             pieces in prop::collection::vec(".{0,16}", 0..6),
             stop in "[a-zA-Z]{1,4}",
         ) {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
             let mut slot = streaming_slot(tx, &[stop.as_str()]);
 
             let mut stopped = false;
@@ -2431,7 +2624,7 @@ mod tests {
             text in "[aé→𝄞]{0,24}",
             stop in "[aé→𝄞]{1,3}",
         ) {
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
             let mut slot = streaming_slot(tx, &[stop.as_str()]);
             slot.text = text;
             let held = slot.holdback();

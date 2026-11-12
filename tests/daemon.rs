@@ -213,6 +213,20 @@ fn daemon_rejects_a_missing_model_argument() {
 }
 
 #[test]
+fn daemon_fails_with_nonzero_exit_on_model_load_failure() {
+    // Finding 2: Startup handshake must cause the daemon process to exit
+    // non-zero when the model fails to load, instead of listening blindly.
+    let out = Command::new(env!("CARGO_BIN_EXE_llamad"))
+        .arg("/nonexistent/model.gguf")
+        .output()
+        .expect("run the daemon with nonexistent model");
+    assert!(
+        !out.status.success(),
+        "daemon must exit non-zero on startup failure"
+    );
+}
+
+#[test]
 fn daemon_help_exits_zero() {
     let out = Command::new(env!("CARGO_BIN_EXE_llamad"))
         .arg("--help")

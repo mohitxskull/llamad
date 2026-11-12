@@ -99,6 +99,9 @@ impl From<llama_cpp_4::NewLlamaChatMessageError> for LlamaError {
     }
 }
 
+/// The current wire protocol version.
+pub const PROTOCOL_VERSION: &str = "1.0";
+
 /// One completion request. Unknown JSON fields are rejected.
 ///
 /// `None` fields are omitted when serializing, so a round-trip through the
@@ -106,6 +109,9 @@ impl From<llama_cpp_4::NewLlamaChatMessageError> for LlamaError {
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
+    /// Protocol version. Optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// The user turn. Required.
     pub prompt: String,
     /// Optional system prompt, prepended before `history`.
@@ -190,6 +196,9 @@ pub struct HistoryMessage {
 /// The non-streaming socket response body.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Response {
+    /// Protocol version. Optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// The generated text.
     pub text: String,
     /// Tokens in the templated prompt.
@@ -231,13 +240,111 @@ impl From<Response> for StreamDone {
     }
 }
 
+/// Machine-readable structured error information.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ErrorDetail {
+    /// Stable machine-readable error code (e.g. "BUSY", "`PROMPT_TOO_LONG`").
+    pub code: String,
+    /// Human-readable error description.
+    pub message: String,
+    /// Whether the client may retry the request.
+    pub retryable: bool,
+}
+
 /// The body the daemon writes for any failure, in both streaming and
 /// non-streaming mode.
+///
+/// Supports backwards-compatible strings as well as structured [`ErrorDetail`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ErrorResponse {
-    /// Human-readable description. Not a stable machine-readable code — in
-    /// process, match on [`LlamaError`] instead.
-    pub error: String,
+    /// Error body: either a structured detail or a plain description string.
+    pub error: ErrorBody,
+}
+
+/// The payload of an [`ErrorResponse`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ErrorBody {
+    /// Structured machine-readable error details.
+    Detail(ErrorDetail),
+    /// Plain string error message.
+    Message(String),
+}
+
+impl ErrorResponse {
+    /// Create a plain string error response.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        ErrorResponse {
+            error: ErrorBody::Message(message.into()),
+        }
+    }
+
+    /// Create a structured error response with code, message, and retryability flag.
+    #[must_use]
+    pub fn structured(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        ErrorResponse {
+            error: ErrorBody::Detail(ErrorDetail {
+                code: code.into(),
+                message: message.into(),
+                retryable,
+            }),
+        }
+    }
+
+    /// Convert a [`LlamaError`] into a structured [`ErrorResponse`].
+    #[must_use]
+    pub fn from_llama_error(err: &LlamaError) -> Self {
+        match err {
+            LlamaError::Busy => Self::structured("BUSY", err.to_string(), true),
+            LlamaError::PromptTooLong { .. } => {
+                Self::structured("PROMPT_TOO_LONG", err.to_string(), false)
+            }
+            LlamaError::ModelLoad(_) => {
+                Self::structured("MODEL_LOAD_FAILED", err.to_string(), false)
+            }
+            LlamaError::InferenceCrashed => {
+                Self::structured("INFERENCE_CRASHED", err.to_string(), true)
+            }
+            LlamaError::Disconnected => Self::structured("DISCONNECTED", err.to_string(), false),
+            LlamaError::Protocol(_) => Self::structured("PROTOCOL_ERROR", err.to_string(), false),
+            LlamaError::Inference(_) => {
+                Self::structured("INFERENCE_FAILED", err.to_string(), false)
+            }
+            LlamaError::Io(_) => Self::structured("IO_ERROR", err.to_string(), false),
+        }
+    }
+
+    /// Human-readable error message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match &self.error {
+            ErrorBody::Detail(d) => &d.message,
+            ErrorBody::Message(m) => m,
+        }
+    }
+
+    /// Stable machine-readable error code if present.
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        match &self.error {
+            ErrorBody::Detail(d) => Some(&d.code),
+            ErrorBody::Message(_) => None,
+        }
+    }
+
+    /// Whether this error represents a transient condition suitable for retry.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match &self.error {
+            ErrorBody::Detail(d) => d.retryable,
+            ErrorBody::Message(_) => false,
+        }
+    }
 }
 
 /// A finished completion with its token accounting.
@@ -258,6 +365,7 @@ pub struct InferResult {
 impl From<InferResult> for Response {
     fn from(r: InferResult) -> Self {
         Response {
+            version: None,
             text: r.text,
             prompt_tokens: r.prompt_tokens,
             generated_tokens: r.generated_tokens,
@@ -273,6 +381,13 @@ impl Request {
             prompt: prompt.into(),
             ..Default::default()
         }
+    }
+
+    /// Set the protocol version.
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     /// Set the system prompt.
@@ -411,7 +526,7 @@ pub enum InferCmd {
         /// The request to prepare and run.
         request: Request,
         /// Receives each complete UTF-8 fragment as it is generated.
-        token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        token_tx: tokio::sync::mpsc::Sender<String>,
         /// Receives the final result once generation ends. Sent before
         /// `token_tx` is dropped, so a closed token channel implies the done
         /// signal is already in flight.
@@ -472,7 +587,7 @@ pub(crate) enum PreparedCmd {
     },
     RunStream {
         req: PreparedRequest,
-        token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        token_tx: tokio::sync::mpsc::Sender<String>,
         done_tx: Option<tokio::sync::oneshot::Sender<Result<InferResult, LlamaError>>>,
     },
     Shutdown,
@@ -572,6 +687,7 @@ mod tests {
     #[test]
     fn test_serialize_response() {
         let resp = Response {
+            version: None,
             text: "2 + 2 = 4".into(),
             prompt_tokens: 10,
             generated_tokens: 5,
@@ -630,6 +746,7 @@ mod tests {
         // object, not `{"response":{...},"done":true}`. A dropped
         // `#[serde(flatten)]` would nest it and break every streaming client.
         let done = StreamDone::from(Response {
+            version: None,
             text: "hi".into(),
             prompt_tokens: 3,
             generated_tokens: 1,
@@ -656,6 +773,7 @@ mod tests {
         assert_eq!(
             Response::from(result),
             Response {
+                version: None,
                 text: "out".into(),
                 prompt_tokens: 9,
                 generated_tokens: 4,
@@ -727,12 +845,23 @@ mod tests {
 
     #[test]
     fn test_error_response_round_trips() {
-        let err = ErrorResponse {
-            error: "boom".into(),
-        };
+        let err = ErrorResponse::new("boom");
         let json = serde_json::to_string(&err).unwrap();
         assert_eq!(json, r#"{"error":"boom"}"#);
         assert_eq!(serde_json::from_str::<ErrorResponse>(&json).unwrap(), err);
+
+        let structured =
+            ErrorResponse::structured("PROMPT_TOO_LONG", "prompt exceeds context", false);
+        let struct_json = serde_json::to_string(&structured).unwrap();
+        assert_eq!(
+            struct_json,
+            r#"{"error":{"code":"PROMPT_TOO_LONG","message":"prompt exceeds context","retryable":false}}"#
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&struct_json).unwrap();
+        assert_eq!(parsed, structured);
+        assert_eq!(parsed.code(), Some("PROMPT_TOO_LONG"));
+        assert_eq!(parsed.message(), "prompt exceeds context");
+        assert!(!parsed.is_retryable());
     }
 
     #[test]

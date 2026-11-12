@@ -103,6 +103,7 @@ fn per_engine_config_is_clamped_not_trusted() {
             n_threads: 0,
             n_threads_batch: 0,
             kv_cache: true,
+            max_queue: 64,
         },
     )
     .expect("client with a degenerate config");
@@ -183,7 +184,7 @@ fn dropping_an_engine_joins_promptly_while_a_slot_is_busy() {
     unsafe { std::env::set_var("LLAMAD_N_SLOTS", "1") };
     let engine = Engine::start(model_hybrid()).expect("start engine");
 
-    let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(64);
     engine
         .send(InferCmd::RunStream {
             // Far more tokens than the drop below should ever wait for.

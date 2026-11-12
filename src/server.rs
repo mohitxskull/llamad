@@ -187,11 +187,17 @@ async fn write_line<S: AsyncWrite + Unpin>(stream: &mut S, line: &str) -> bool {
 
 /// Write an `{"error": ...}` reply. Failures are ignored: the connection is
 /// being abandoned either way, and there is nobody left to report to.
-async fn reply_error<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) {
-    let err = ErrorResponse {
-        error: message.to_owned(),
-    };
+pub async fn reply_error<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) {
+    let err = ErrorResponse::new(message);
     if let Ok(json) = serde_json::to_string(&err) {
+        let _ = write_line(stream, &json).await;
+    }
+}
+
+/// Write a structured `{"error": {"code": ...}}` reply derived from a [`LlamaError`].
+async fn reply_llama_error<S: AsyncWrite + Unpin>(stream: &mut S, err: &LlamaError) {
+    let resp = ErrorResponse::from_llama_error(err);
+    if let Ok(json) = serde_json::to_string(&resp) {
         let _ = write_line(stream, &json).await;
     }
 }
@@ -202,7 +208,7 @@ async fn reply_error<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) {
 /// Windows named pipe; only the listener differs by platform.
 pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    cmd_tx: &mpsc::Sender<InferCmd>,
+    cmd_tx: &mpsc::SyncSender<InferCmd>,
 ) {
     let buf = match tokio::time::timeout(READ_TIMEOUT, read_frame(stream)).await {
         Ok(Ok(Some(buf))) => buf,
@@ -258,21 +264,25 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    cmd_tx: &mpsc::Sender<InferCmd>,
+    cmd_tx: &mpsc::SyncSender<InferCmd>,
     req: Request,
 ) {
-    let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(64);
     let (done_tx, done_rx) = oneshot::channel();
 
-    if cmd_tx
-        .send(InferCmd::RunStream {
-            request: req,
-            token_tx,
-            done_tx: Some(done_tx),
-        })
-        .is_err()
-    {
-        reply_error(stream, "inference thread unavailable").await;
+    if let Err(err) = cmd_tx.try_send(InferCmd::RunStream {
+        request: req,
+        token_tx,
+        done_tx: Some(done_tx),
+    }) {
+        match err {
+            mpsc::TrySendError::Full(_) => {
+                reply_llama_error(stream, &LlamaError::Busy).await;
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                reply_error(stream, "inference thread unavailable").await;
+            }
+        }
         return;
     }
 
@@ -301,7 +311,7 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Ok(Err(e)) => {
-            reply_error(stream, &format!("inference: {e}")).await;
+            reply_llama_error(stream, &e).await;
         }
         Err(_) => {
             reply_error(stream, "inference stream ended unexpectedly").await;
@@ -311,19 +321,23 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    cmd_tx: &mpsc::Sender<InferCmd>,
+    cmd_tx: &mpsc::SyncSender<InferCmd>,
     req: Request,
 ) {
     let (resp_tx, resp_rx) = oneshot::channel();
 
-    if cmd_tx
-        .send(InferCmd::Run {
-            request: req,
-            resp: resp_tx,
-        })
-        .is_err()
-    {
-        reply_error(stream, "inference thread unavailable").await;
+    if let Err(err) = cmd_tx.try_send(InferCmd::Run {
+        request: req,
+        resp: resp_tx,
+    }) {
+        match err {
+            mpsc::TrySendError::Full(_) => {
+                reply_llama_error(stream, &LlamaError::Busy).await;
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                reply_error(stream, "inference thread unavailable").await;
+            }
+        }
         return;
     }
 
@@ -334,7 +348,7 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Ok(Err(e)) => {
-            reply_error(stream, &format!("inference: {e}")).await;
+            reply_llama_error(stream, &e).await;
         }
         Err(_) => {
             reply_error(stream, "inference thread crashed").await;
@@ -363,8 +377,8 @@ mod test_support {
 
     /// An "inference thread" that echoes the prompt back, so the protocol can
     /// be exercised without loading a model.
-    pub(super) fn spawn_mock_inference() -> mpsc::Sender<InferCmd> {
-        let (tx, rx) = mpsc::channel();
+    pub(super) fn spawn_mock_inference() -> mpsc::SyncSender<InferCmd> {
+        let (tx, rx) = mpsc::sync_channel(64);
         thread::spawn(move || {
             for cmd in rx {
                 match cmd {
@@ -381,7 +395,7 @@ mod test_support {
                         done_tx,
                     } => {
                         for ch in request.prompt.chars() {
-                            let _ = token_tx.send(ch.to_string());
+                            let _ = token_tx.blocking_send(ch.to_string());
                         }
                         if let Some(done) = done_tx {
                             let _ = done.send(Ok(InferResult {
@@ -401,8 +415,8 @@ mod test_support {
 
     /// A sender whose receiver is already dropped, so every send fails — the
     /// "inference thread is gone" condition.
-    pub(super) fn dead_sender() -> mpsc::Sender<InferCmd> {
-        let (tx, rx) = mpsc::channel();
+    pub(super) fn dead_sender() -> mpsc::SyncSender<InferCmd> {
+        let (tx, rx) = mpsc::sync_channel(64);
         drop(rx);
         tx
     }
@@ -444,7 +458,7 @@ mod tests {
     /// so the kernel queues a connect that arrives before the accept task is
     /// scheduled. The 100 ms sleeps this replaces were not synchronizing
     /// anything — they only made the suite a second slower.
-    async fn with_server<F, Fut>(tag: &str, cmd_tx: mpsc::Sender<InferCmd>, client_body: F)
+    async fn with_server<F, Fut>(tag: &str, cmd_tx: mpsc::SyncSender<InferCmd>, client_body: F)
     where
         F: FnOnce(tokio::net::UnixStream) -> Fut,
         Fut: std::future::Future<Output = ()>,
@@ -711,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_protocol_inference_error_propagates() {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<InferCmd>(64);
         thread::spawn(move || {
             for cmd in cmd_rx {
                 if let InferCmd::Run { resp, .. } = cmd {
@@ -723,21 +737,23 @@ mod tests {
         with_server("infer-err", cmd_tx, |client| async move {
             let req = serde_json::json!({"prompt": "crash me"});
             let resp = round_trip_json(client, &req.to_string()).await;
-            assert!(resp["error"].as_str().unwrap().contains("model exploded"));
+            let err_resp: ErrorResponse = serde_json::from_value(resp).unwrap();
+            assert!(err_resp.message().contains("model exploded"));
+            assert_eq!(err_resp.code(), Some("INFERENCE_FAILED"));
         })
         .await;
     }
 
     #[tokio::test]
     async fn test_protocol_streaming_inference_error_propagates() {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<InferCmd>(64);
         thread::spawn(move || {
             for cmd in cmd_rx {
                 if let InferCmd::RunStream {
                     token_tx, done_tx, ..
                 } = cmd
                 {
-                    let _ = token_tx.send("partial ".to_string());
+                    let _ = token_tx.blocking_send("partial ".to_string());
                     if let Some(done) = done_tx {
                         let _ = done.send(Err(LlamaError::Inference(
                             "model exploded mid-stream".into(),
@@ -755,20 +771,16 @@ mod tests {
             let lines: Vec<&str> = output.lines().collect();
             assert!(!lines.is_empty(), "expected at least 1 line, got {lines:?}");
             assert_eq!(lines[0], r#"{"token":"partial "}"#);
-            let err_line: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-            assert!(
-                err_line["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("model exploded mid-stream")
-            );
+            let err_resp: ErrorResponse = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert!(err_resp.message().contains("model exploded mid-stream"));
+            assert_eq!(err_resp.code(), Some("INFERENCE_FAILED"));
         })
         .await;
     }
 
     #[tokio::test]
     async fn test_protocol_streaming_done_tx_dropped() {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<InferCmd>();
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<InferCmd>(64);
         thread::spawn(move || {
             for cmd in cmd_rx {
                 if let InferCmd::RunStream { token_tx, .. } = cmd {
@@ -826,7 +838,7 @@ mod windows_tests {
     /// transport can express — the property the Unix suite's
     /// `test_newline_terminated_request_without_half_close` guards from the
     /// other side.
-    async fn round_trip(tag: &str, cmd_tx: mpsc::Sender<InferCmd>, request: &str) -> String {
+    async fn round_trip(tag: &str, cmd_tx: mpsc::SyncSender<InferCmd>, request: &str) -> String {
         let name = pipe_name(tag);
         let mut server_pipe = bind_pipe(&name, true).expect("bind pipe");
         let server = tokio::spawn(async move {
