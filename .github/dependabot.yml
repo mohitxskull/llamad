@@ -15,3 +15,7 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "deps"
+    ignore:
+      # proptest >= 1.12 pulls in borsh -> syn 3, breaking bindgen (which links prettyplease on syn 2)
+      - dependency-name: "proptest"
+        versions: [">= 1.12.0"]
