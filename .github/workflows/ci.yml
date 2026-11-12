@@ -89,7 +89,7 @@ jobs:
       # Pull requests restore this from main's cache; their own entries are
       # discarded when the PR closes.
       - name: Cache GGUF fixtures
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: models/*.gguf
           key: gguf-${{ hashFiles('models/download.sh') }}
@@ -226,7 +226,7 @@ jobs:
       - uses: taiki-e/install-action@3f7c3597aa4e6da3f315e128de702ce61e7b2877 # cargo-llvm-cov
 
       - name: Cache GGUF fixtures
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: models/*.gguf
           key: gguf-${{ hashFiles('models/download.sh') }}
