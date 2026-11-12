@@ -151,7 +151,11 @@ pub fn model_hybrid_large() -> String {
 
 /// Pure-attention model, or `None` to skip.
 pub fn model_attention() -> Option<String> {
-    ATTENTION.optional()
+    if ATTENTION.available() {
+        Some(ATTENTION.path())
+    } else {
+        None
+    }
 }
 
 // ── Global tracing capture layer ────────────────────────────────────────────
