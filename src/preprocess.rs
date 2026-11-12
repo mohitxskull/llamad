@@ -186,6 +186,7 @@ pub(crate) fn prepare_request(
         .map_err(|e| LlamaError::Inference(e.to_string()))?;
     let (max_gen, sampling) = resolve_defaults(tokens.len(), request, per_slot_budget)?;
     Ok(PreparedRequest {
+        request_id: request.request_id.clone(),
         tokens,
         max_gen,
         sampling,

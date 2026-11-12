@@ -368,6 +368,7 @@ mod tests {
                     let _ = token_tx.blocking_send("hi".to_string());
                     if let Some(done) = done_tx {
                         let _ = done.send(Ok(InferResult {
+                            request_id: None,
                             text: "hi".into(),
                             prompt_tokens: 7,
                             generated_tokens: 1,
@@ -480,6 +481,7 @@ mod tests {
                 match cmd {
                     InferCmd::Run { request, resp } => {
                         let result = InferResult {
+                            request_id: request.request_id,
                             text: format!("echo: {}", request.prompt),
                             prompt_tokens: 3,
                             generated_tokens: 5,
@@ -496,6 +498,7 @@ mod tests {
                         }
                         if let Some(done) = done_tx {
                             let _ = done.send(Ok(InferResult {
+                                request_id: request.request_id,
                                 text: format!("echo: {}", request.prompt),
                                 prompt_tokens: 3,
                                 generated_tokens: request.prompt.len(),

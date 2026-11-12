@@ -57,6 +57,7 @@ enum Emit {
 }
 
 struct Slot {
+    request_id: Option<String>,
     prompt_tokens: Vec<LlamaToken>,
     n_prompt: usize,
     gen_count: usize,
@@ -236,6 +237,7 @@ impl Slot {
             _ => {}
         }
         let result = InferResult {
+            request_id: self.request_id.clone(),
             text: std::mem::take(&mut self.text),
             prompt_tokens: self.n_prompt,
             generated_tokens: self.gen_count,
@@ -492,10 +494,17 @@ struct Channels {
 /// [`Slot::begin_request`], which installs the tokens and derives `n_prompt`
 /// and `kv_pos` from the slot's retained KV prefix. Taking the tokens here too
 /// would mean computing `n_prompt` twice from different sources.
-fn create_slot(max_gen: u32, sampler: LlamaSampler, stop: Vec<String>, channels: Channels) -> Slot {
+fn create_slot(
+    request_id: Option<String>,
+    max_gen: u32,
+    sampler: LlamaSampler,
+    stop: Vec<String>,
+    channels: Channels,
+) -> Slot {
     let stop_max_len = stop.iter().map(String::len).max().unwrap_or(0);
 
     Slot {
+        request_id,
         prompt_tokens: Vec::new(),
         n_prompt: 0,
         gen_count: 0,
@@ -1045,7 +1054,7 @@ impl Scheduler<'_> {
                 return;
             }
         };
-        let mut slot = create_slot(req.max_gen, sampler, req.stop, channels);
+        let mut slot = create_slot(req.request_id, req.max_gen, sampler, req.stop, channels);
         let cached = std::mem::take(&mut self.slot_cache[idx]);
         let lcp = slot.begin_request(req.tokens, cached);
         if lcp > 0 {
@@ -1721,6 +1730,7 @@ mod tests {
     /// not require touching every test.
     fn base_slot() -> Slot {
         Slot {
+            request_id: None,
             prompt_tokens: vec![],
             n_prompt: 0,
             gen_count: 0,

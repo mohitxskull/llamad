@@ -102,16 +102,19 @@ impl From<llama_cpp_4::NewLlamaChatMessageError> for LlamaError {
 /// The current wire protocol version.
 pub const PROTOCOL_VERSION: &str = "1.0";
 
-/// One completion request. Unknown JSON fields are rejected.
+/// One completion request. Unknown JSON fields are ignored to support
+/// forward-compatible additive schema evolution.
 ///
 /// `None` fields are omitted when serializing, so a round-trip through the
 /// socket protocol reproduces the same request.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct Request {
     /// Protocol version. Optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Optional client-provided request ID for end-to-end tracing and correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// The user turn. Required.
     pub prompt: String,
     /// Optional system prompt, prepended before `history`.
@@ -183,9 +186,8 @@ pub struct Request {
     pub history: Vec<HistoryMessage>,
 }
 
-/// One prior conversation turn.
+/// One prior conversation turn. Unknown JSON fields are ignored for forward compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct HistoryMessage {
     /// Chat role, e.g. `"user"` or `"assistant"`. Must not contain null bytes.
     pub role: String,
@@ -199,6 +201,9 @@ pub struct Response {
     /// Protocol version. Optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Request ID correlated with the request if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// The generated text.
     pub text: String,
     /// Tokens in the templated prompt.
@@ -257,6 +262,12 @@ pub struct ErrorDetail {
 /// Supports backwards-compatible strings as well as structured [`ErrorDetail`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ErrorResponse {
+    /// Protocol version. Optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Request ID correlated with the request if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     /// Error body: either a structured detail or a plain description string.
     pub error: ErrorBody,
 }
@@ -276,6 +287,8 @@ impl ErrorResponse {
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
         ErrorResponse {
+            version: None,
+            request_id: None,
             error: ErrorBody::Message(message.into()),
         }
     }
@@ -288,12 +301,28 @@ impl ErrorResponse {
         retryable: bool,
     ) -> Self {
         ErrorResponse {
+            version: None,
+            request_id: None,
             error: ErrorBody::Detail(ErrorDetail {
                 code: code.into(),
                 message: message.into(),
                 retryable,
             }),
         }
+    }
+
+    /// Set the correlated request ID.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    /// Set the protocol version.
+    #[must_use]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     /// Convert a [`LlamaError`] into a structured [`ErrorResponse`].
@@ -350,6 +379,8 @@ impl ErrorResponse {
 /// A finished completion with its token accounting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferResult {
+    /// Request ID correlated with the request if present.
+    pub request_id: Option<String>,
     /// The generated text.
     pub text: String,
     /// Tokens in the templated prompt.
@@ -366,6 +397,7 @@ impl From<InferResult> for Response {
     fn from(r: InferResult) -> Self {
         Response {
             version: None,
+            request_id: r.request_id,
             text: r.text,
             prompt_tokens: r.prompt_tokens,
             generated_tokens: r.generated_tokens,
@@ -387,6 +419,13 @@ impl Request {
     #[must_use]
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
+        self
+    }
+
+    /// Set the request ID for end-to-end tracing and correlation.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
         self
     }
 
@@ -571,6 +610,7 @@ pub(crate) struct Grammar {
 /// normalized, and any grammar already validated against the model's
 /// vocabulary.
 pub(crate) struct PreparedRequest {
+    pub request_id: Option<String>,
     pub tokens: Vec<LlamaToken>,
     pub max_gen: u32,
     pub sampling: SamplingParams,
@@ -643,10 +683,12 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_request_unknown_field_rejected() {
-        let json = r#"{"prompt":"hi","unknown_field":"value"}"#;
-        let result = serde_json::from_str::<Request>(json);
-        assert!(result.is_err());
+    fn test_deserialize_request_unknown_field_ignored_for_forward_compatibility() {
+        // Postel's law / additive compatibility: new fields from newer clients
+        // are ignored by older daemons without causing failure.
+        let json = r#"{"prompt":"hi","unknown_future_field":"value","future_num":42}"#;
+        let req: Request = serde_json::from_str(json).expect("should accept additive fields");
+        assert_eq!(req.prompt, "hi");
     }
 
     #[test]
@@ -688,6 +730,7 @@ mod tests {
     fn test_serialize_response() {
         let resp = Response {
             version: None,
+            request_id: None,
             text: "2 + 2 = 4".into(),
             prompt_tokens: 10,
             generated_tokens: 5,
@@ -747,6 +790,7 @@ mod tests {
         // `#[serde(flatten)]` would nest it and break every streaming client.
         let done = StreamDone::from(Response {
             version: None,
+            request_id: None,
             text: "hi".into(),
             prompt_tokens: 3,
             generated_tokens: 1,
@@ -766,6 +810,7 @@ mod tests {
         // The conversion exists so the wire type cannot drift from the
         // internal one; this pins that every field carries across.
         let result = InferResult {
+            request_id: Some("req-1".into()),
             text: "out".into(),
             prompt_tokens: 9,
             generated_tokens: 4,
@@ -774,6 +819,7 @@ mod tests {
             Response::from(result),
             Response {
                 version: None,
+                request_id: Some("req-1".into()),
                 text: "out".into(),
                 prompt_tokens: 9,
                 generated_tokens: 4,
@@ -865,10 +911,46 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_history_message_unknown_field_rejected() {
-        let json = r#"{"role":"user","content":"hi","extra":"bad"}"#;
-        let result = serde_json::from_str::<HistoryMessage>(json);
-        assert!(result.is_err());
+    fn test_deserialize_history_message_unknown_field_ignored_for_forward_compatibility() {
+        let json = r#"{"role":"user","content":"hi","extra":"metadata"}"#;
+        let msg: HistoryMessage =
+            serde_json::from_str(json).expect("should accept additive fields");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "hi");
+    }
+
+    #[test]
+    fn test_schema_forward_compatibility_response_and_errors() {
+        // Responses and ErrorResponses with future fields parse cleanly without error
+        let resp_json = r#"{"text":"hello","prompt_tokens":5,"generated_tokens":2,"future_stats":{"confidence":0.99}}"#;
+        let resp: Response =
+            serde_json::from_str(resp_json).expect("parse forward-compatible response");
+        assert_eq!(resp.text, "hello");
+
+        let err_json = r#"{"error":{"code":"BUSY","message":"busy","retryable":true,"estimated_wait_ms":200}}"#;
+        let err: ErrorResponse =
+            serde_json::from_str(err_json).expect("parse forward-compatible error");
+        assert_eq!(err.code(), Some("BUSY"));
+
+        let done_json = r#"{"done":true,"text":"hi","prompt_tokens":2,"generated_tokens":1,"telemetry_id":"xyz"}"#;
+        let done: StreamDone =
+            serde_json::from_str(done_json).expect("parse forward-compatible stream done");
+        assert!(done.done);
+        assert_eq!(done.response.text, "hi");
+    }
+
+    #[test]
+    fn test_request_id_round_trip() {
+        let req = Request::new("say hello")
+            .with_request_id("req-12345")
+            .with_version(PROTOCOL_VERSION);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""request_id":"req-12345""#));
+        assert!(json.contains(r#""version":"1.0""#));
+
+        let deserialized: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.request_id.as_deref(), Some("req-12345"));
+        assert_eq!(deserialized.version.as_deref(), Some("1.0"));
     }
 
     #[test]

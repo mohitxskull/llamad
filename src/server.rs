@@ -195,8 +195,15 @@ pub async fn reply_error<S: AsyncWrite + Unpin>(stream: &mut S, message: &str) {
 }
 
 /// Write a structured `{"error": {"code": ...}}` reply derived from a [`LlamaError`].
-async fn reply_llama_error<S: AsyncWrite + Unpin>(stream: &mut S, err: &LlamaError) {
-    let resp = ErrorResponse::from_llama_error(err);
+async fn reply_llama_error<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    err: &LlamaError,
+    request_id: Option<&str>,
+) {
+    let mut resp = ErrorResponse::from_llama_error(err);
+    if let Some(id) = request_id {
+        resp = resp.with_request_id(id);
+    }
     if let Ok(json) = serde_json::to_string(&resp) {
         let _ = write_line(stream, &json).await;
     }
@@ -267,6 +274,7 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     cmd_tx: &mpsc::SyncSender<InferCmd>,
     req: Request,
 ) {
+    let request_id = req.request_id.clone();
     let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(64);
     let (done_tx, done_rx) = oneshot::channel();
 
@@ -277,7 +285,7 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     }) {
         match err {
             mpsc::TrySendError::Full(_) => {
-                reply_llama_error(stream, &LlamaError::Busy).await;
+                reply_llama_error(stream, &LlamaError::Busy, request_id.as_deref()).await;
             }
             mpsc::TrySendError::Disconnected(_) => {
                 reply_error(stream, "inference thread unavailable").await;
@@ -311,7 +319,7 @@ async fn handle_streaming<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Ok(Err(e)) => {
-            reply_llama_error(stream, &e).await;
+            reply_llama_error(stream, &e, request_id.as_deref()).await;
         }
         Err(_) => {
             reply_error(stream, "inference stream ended unexpectedly").await;
@@ -324,6 +332,7 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     cmd_tx: &mpsc::SyncSender<InferCmd>,
     req: Request,
 ) {
+    let request_id = req.request_id.clone();
     let (resp_tx, resp_rx) = oneshot::channel();
 
     if let Err(err) = cmd_tx.try_send(InferCmd::Run {
@@ -332,7 +341,7 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
     }) {
         match err {
             mpsc::TrySendError::Full(_) => {
-                reply_llama_error(stream, &LlamaError::Busy).await;
+                reply_llama_error(stream, &LlamaError::Busy, request_id.as_deref()).await;
             }
             mpsc::TrySendError::Disconnected(_) => {
                 reply_error(stream, "inference thread unavailable").await;
@@ -348,7 +357,7 @@ async fn handle_non_streaming<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
         Ok(Err(e)) => {
-            reply_llama_error(stream, &e).await;
+            reply_llama_error(stream, &e, request_id.as_deref()).await;
         }
         Err(_) => {
             reply_error(stream, "inference thread crashed").await;
@@ -384,6 +393,7 @@ mod test_support {
                 match cmd {
                     InferCmd::Run { request, resp } => {
                         let _ = resp.send(Ok(InferResult {
+                            request_id: request.request_id,
                             text: format!("echo: {}", request.prompt),
                             prompt_tokens: 5,
                             generated_tokens: 2,
@@ -399,6 +409,7 @@ mod test_support {
                         }
                         if let Some(done) = done_tx {
                             let _ = done.send(Ok(InferResult {
+                                request_id: request.request_id,
                                 text: format!("echo: {}", request.prompt),
                                 prompt_tokens: 5,
                                 generated_tokens: request.prompt.len(),
