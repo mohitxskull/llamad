@@ -71,6 +71,46 @@ fn drop_token_stream_cancels_inference() {
     engine.shutdown();
 }
 
+#[serial]
+#[test]
+fn drop_non_streaming_receiver_cancels_inference() {
+    unsafe { std::env::set_var("LLAMAD_N_SLOTS", "1") };
+    let engine = start_inference(model_hybrid()).expect("start inference thread");
+
+    // First request: a long non-streaming generation.
+    let (resp_tx1, resp_rx1) = tokio::sync::oneshot::channel();
+    engine
+        .send(InferCmd::Run {
+            request: Request::new("write a long story about a dragon").with_max_tokens(5000),
+            resp: resp_tx1,
+        })
+        .expect("send first non-streaming request");
+
+    // Allow inference loop to admit the slot and begin generating.
+    std::thread::sleep(Duration::from_millis(500));
+    // Dropping the receiver closes the oneshot channel, requesting cancellation.
+    drop(resp_rx1);
+
+    // Second request: same single slot. If cancellation did not free the slot,
+    // this request would queue behind 5000 tokens and time out.
+    let (resp_tx2, resp_rx2) = tokio::sync::oneshot::channel();
+    engine
+        .send(InferCmd::Run {
+            request: Request::new("second non-streaming request").with_max_tokens(10),
+            resp: resp_tx2,
+        })
+        .expect("send second non-streaming request");
+
+    let result = resp_rx2
+        .blocking_recv()
+        .expect("second response arrived")
+        .expect("second completion succeeded");
+    assert!(!result.text.is_empty());
+    assert!(result.generated_tokens <= 10);
+
+    engine.shutdown();
+}
+
 /// First token of a stream, or `None` if it ends; panics on timeout.
 /// (tokio's unbounded receiver has no `blocking_recv_timeout`, so poll with
 /// a hard deadline.)

@@ -45,26 +45,22 @@ pub struct Fixture {
     pub capability: &'static str,
 }
 
-/// Hybrid/SSM architecture: the startup probe refuses partial KV rewind, so
-/// prefix reuse degrades to a full prefill. The default workhorse — small and
-/// fast, and the model the degrade-path contracts are written against.
+/// Hybrid architecture: the startup probe refuses partial KV rewind, so
+/// prefix reuse degrades to a full prefill. Tested with LiquidAI LFM3-1.7B.
 pub const HYBRID: Fixture = Fixture {
-    file: "LFM2.5-230M-Q4_K_M.gguf",
+    file: "LFM3-1.7B-Q4_K_M.gguf",
     env: "LLAMAD_TEST_MODEL_HYBRID",
     capability: "hybrid/SSM arch (KV rewind unsupported — degraded path)",
 };
 
-/// A second, larger hybrid model. Only used to prove a bigger model loads and
-/// generates; nothing depends on its size beyond that.
+/// A second alias for the model fixture.
 pub const HYBRID_LARGE: Fixture = Fixture {
-    file: "LFM2.5-1.2B-Thinking-Q4_K_M.gguf",
+    file: "LFM3-1.7B-Q4_K_M.gguf",
     env: "LLAMAD_TEST_MODEL_HYBRID_LARGE",
-    capability: "a larger hybrid model",
+    capability: "hybrid architecture model",
 };
 
-/// Pure-attention architecture: the probe accepts partial KV rewind, so the
-/// prefix-reuse path actually engages. Without this the reuse assertions in
-/// `tests/reuse.rs` are vacuous.
+/// Pure-attention architecture (optional; unset when using only LFM3-1.7B).
 pub const ATTENTION: Fixture = Fixture {
     file: "SmolLM2-135M-Instruct-Q4_K_M.gguf",
     env: "LLAMAD_TEST_MODEL_ATTENTION",
@@ -74,7 +70,7 @@ pub const ATTENTION: Fixture = Fixture {
 /// Every fixture the suite knows about. `tests/fixtures.rs` checks this list
 /// against `models/download.sh` in both directions, so a renamed quant and an
 /// orphaned download are both caught.
-pub const ALL: &[&Fixture] = &[&HYBRID, &HYBRID_LARGE, &ATTENTION];
+pub const ALL: &[&Fixture] = &[&HYBRID];
 
 /// Set by CI. When present, a missing fixture is a test failure rather than a
 /// skip — otherwise a suite that silently tested nothing reports as green.

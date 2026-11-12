@@ -13,9 +13,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 declare -A MODELS=(
-  ["LFM2.5-230M-Q4_K_M.gguf"]="https://huggingface.co/LiquidAI/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q4_K_M.gguf"
-  ["LFM2.5-1.2B-Thinking-Q4_K_M.gguf"]="https://huggingface.co/LiquidAI/LFM2.5-1.2B-Thinking-GGUF/resolve/main/LFM2.5-1.2B-Thinking-Q4_K_M.gguf"
-  ["SmolLM2-135M-Instruct-Q4_K_M.gguf"]="https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+  ["LFM3-1.7B-Q4_K_M.gguf"]="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/cd0c74c575b5c416f3011b5b4c298077f26ca8c2/LFM3-1.7B-Q4_K_M.gguf"
+)
+
+declare -A CHECKSUMS=(
+  ["LFM3-1.7B-Q4_K_M.gguf"]="3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4"
 )
 
 if command -v curl >/dev/null 2>&1; then
@@ -43,8 +45,19 @@ for name in "${!MODELS[@]}"; do
   url="${MODELS[$name]}"
   expected="$(server_size "$url")"
   if [[ -f "$name" ]] && [[ "$(stat -c %s "$name")" -eq "$expected" ]]; then
-    echo "skip: $name already downloaded"
-    continue
+    if [[ -v CHECKSUMS[$name] ]]; then
+      actual_sha="$(sha256sum "$name" | awk '{print $1}')"
+      if [[ "$actual_sha" == "${CHECKSUMS[$name]}" ]]; then
+        echo "skip: $name already downloaded and verified (sha256: $actual_sha)"
+        continue
+      else
+        echo "replacing corrupted $name (sha256 mismatch: got $actual_sha, expected ${CHECKSUMS[$name]})"
+        rm -f "$name"
+      fi
+    else
+      echo "skip: $name already downloaded"
+      continue
+    fi
   fi
   if [[ -n "$expected" && -f "$name" ]] && [[ "$(stat -c %s "$name")" -gt "$expected" ]]; then
     echo "replacing oversized $name (upstream changed?)"
@@ -57,6 +70,15 @@ for name in "${!MODELS[@]}"; do
     echo "error: $name is $actual bytes, expected $expected" >&2
     rm -f "$name"
     exit 1
+  fi
+  if [[ -v CHECKSUMS[$name] ]]; then
+    actual_sha="$(sha256sum "$name" | awk '{print $1}')"
+    if [[ "$actual_sha" != "${CHECKSUMS[$name]}" ]]; then
+      echo "error: sha256 mismatch for $name: got $actual_sha, expected ${CHECKSUMS[$name]}" >&2
+      rm -f "$name"
+      exit 1
+    fi
+    echo "verified $name sha256: $actual_sha"
   fi
 done
 

@@ -247,6 +247,25 @@ impl Slot {
         drop(self.token_tx.take());
     }
 
+    /// Whether the client has disconnected or dropped its response receiver.
+    ///
+    /// Checked before batch preparation and harvesting so abandoned streaming
+    /// or non-streaming requests free their slots immediately without running
+    /// through their remaining token budget.
+    fn is_cancelled(&self) -> bool {
+        if let Some(ref resp) = self.resp
+            && resp.is_closed()
+        {
+            return true;
+        }
+        if let Some(ref token_tx) = self.token_tx
+            && token_tx.is_closed()
+        {
+            return true;
+        }
+        false
+    }
+
     /// Prepare the slot for a new prompt, reusing the cached KV prefix when the
     /// new prompt shares tokens with the cached sequence.
     ///
@@ -1064,6 +1083,10 @@ impl Scheduler<'_> {
                 Some(s) => s,
                 None => continue,
             };
+            if slot.is_cancelled() {
+                self.abandon(&mut slot, seq_id, LlamaError::Disconnected);
+                continue;
+            }
             let sid = seq_id as i32;
 
             if slot.prompt_phase {
@@ -1189,6 +1212,10 @@ impl Scheduler<'_> {
     fn harvest(&mut self) {
         let mut taken = std::mem::take(&mut self.taken);
         for (seq_id, mut slot) in taken.drain(..) {
+            if slot.is_cancelled() {
+                self.abandon(&mut slot, seq_id, LlamaError::Disconnected);
+                continue;
+            }
             let batch_idx = match self.slot_batch_idx[seq_id] {
                 Some(i) => i as i32,
                 None => {
