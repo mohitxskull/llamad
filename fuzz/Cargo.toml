@@ -1,0 +1,29 @@
+[package]
+name = "llamad-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+
+[dependencies.llamad]
+path = ".."
+
+[[bin]]
+name = "fuzz_request_json"
+path = "fuzz_targets/fuzz_request_json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wire_framing"
+path = "fuzz_targets/fuzz_wire_framing.rs"
+test = false
+doc = false

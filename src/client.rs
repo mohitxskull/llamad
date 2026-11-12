@@ -8,6 +8,8 @@ use crate::config::InferenceConfig;
 use crate::inference::{Engine, EngineStatus};
 use crate::protocol::{InferCmd, InferResult, LlamaError, Request};
 
+pub use crate::inference::EngineMetrics;
+
 /// High-level client for a local GGUF model.
 ///
 /// Owns an [`Engine`] — a loaded model plus its inference and preprocess
@@ -235,6 +237,12 @@ impl Client {
     /// The underlying engine, for direct [`InferCmd`] submission.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Return the engine's current operational metrics snapshot.
+    #[must_use]
+    pub fn metrics(&self) -> EngineMetrics {
+        self.engine.metrics()
     }
 
     /// Queue a non-streaming request and hand back its response channel.

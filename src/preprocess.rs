@@ -197,11 +197,21 @@ pub(crate) fn prepare_request(
 
 /// Hand a prepared command to the inference thread, reporting the failure to
 /// the request's own channels if that thread is full or has already exited.
-fn forward(prepared_tx: &mpsc::SyncSender<PreparedCmd>, cmd: PreparedCmd) {
+fn forward(
+    prepared_tx: &mpsc::SyncSender<PreparedCmd>,
+    cmd: PreparedCmd,
+    metrics: &crate::inference::MetricsTracker,
+) {
     match prepared_tx.try_send(cmd) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(returned)) => {
             tracing::warn!("inference queue full, rejecting request with Busy");
+            metrics
+                .queue_depth
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .rejected_busy
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match returned {
                 PreparedCmd::Run { resp, .. } => {
                     let _ = resp.send(Err(LlamaError::Busy));
@@ -217,20 +227,28 @@ fn forward(prepared_tx: &mpsc::SyncSender<PreparedCmd>, cmd: PreparedCmd) {
                 PreparedCmd::Shutdown => {}
             }
         }
-        Err(mpsc::TrySendError::Disconnected(returned)) => match returned {
-            PreparedCmd::Run { resp, .. } => {
-                let _ = resp.send(Err(LlamaError::InferenceCrashed));
-            }
-            PreparedCmd::RunStream {
-                token_tx, done_tx, ..
-            } => {
-                if let Some(done) = done_tx {
-                    let _ = done.send(Err(LlamaError::InferenceCrashed));
+        Err(mpsc::TrySendError::Disconnected(returned)) => {
+            metrics
+                .queue_depth
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            metrics
+                .failed_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match returned {
+                PreparedCmd::Run { resp, .. } => {
+                    let _ = resp.send(Err(LlamaError::InferenceCrashed));
                 }
-                drop(token_tx);
+                PreparedCmd::RunStream {
+                    token_tx, done_tx, ..
+                } => {
+                    if let Some(done) = done_tx {
+                        let _ = done.send(Err(LlamaError::InferenceCrashed));
+                    }
+                    drop(token_tx);
+                }
+                PreparedCmd::Shutdown => {}
             }
-            PreparedCmd::Shutdown => {}
-        },
+        }
     }
 }
 
@@ -241,6 +259,7 @@ pub(super) fn preprocess_loop(
     model_rx: mpsc::Receiver<Arc<LlamaModel>>,
     prepared_tx: mpsc::SyncSender<PreparedCmd>,
     config: InferenceConfig,
+    metrics: Arc<crate::inference::MetricsTracker>,
 ) {
     let model = match model_rx.recv() {
         Ok(model) => model,
@@ -256,9 +275,15 @@ pub(super) fn preprocess_loop(
     for cmd in cmd_rx {
         match cmd {
             InferCmd::Run { request, resp } => match prepare_request(&model, &request, budget) {
-                Ok(req) => forward(&prepared_tx, PreparedCmd::Run { req, resp }),
+                Ok(req) => forward(&prepared_tx, PreparedCmd::Run { req, resp }, &metrics),
                 Err(e) => {
                     tracing::debug!("request rejected in preprocessing: {e}");
+                    metrics
+                        .queue_depth
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .failed_requests
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = resp.send(Err(e));
                 }
             },
@@ -274,9 +299,16 @@ pub(super) fn preprocess_loop(
                         token_tx,
                         done_tx,
                     },
+                    &metrics,
                 ),
                 Err(e) => {
                     tracing::debug!("streaming request rejected in preprocessing: {e}");
+                    metrics
+                        .queue_depth
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .failed_requests
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(done) = done_tx {
                         let _ = done.send(Err(e));
                     }
@@ -375,8 +407,9 @@ mod tests {
         drop(model_tx); // dropped immediately, as when the inference thread dies
         let (prepared_tx, _prepared_rx) = mpsc::sync_channel(64);
         let cfg = InferenceConfig::default();
+        let metrics = Arc::new(crate::inference::MetricsTracker::default());
         let handle = std::thread::spawn(move || {
-            preprocess_loop(cmd_rx, model_rx, prepared_tx, cfg);
+            preprocess_loop(cmd_rx, model_rx, prepared_tx, cfg, metrics);
         });
         handle.join().unwrap();
         let err = cmd_tx.send(InferCmd::Shutdown).unwrap_err();
