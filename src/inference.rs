@@ -209,7 +209,15 @@ impl Slot {
         Emit::Continue
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self) -> Result<()> {
+        if !self.utf8_buf.is_empty() {
+            let err = LlamaError::Inference(format!(
+                "incomplete UTF-8 sequence at end of generation ({} trailing bytes)",
+                self.utf8_buf.len()
+            ));
+            self.cancel(err.clone());
+            return Err(err);
+        }
         // Release anything still withheld for a possible stop match:
         // generation ended without one, so the tail is ordinary output.
         let end = self.text.len();
@@ -226,6 +234,7 @@ impl Slot {
             let _ = done.send(Ok(result));
         }
         drop(self.token_tx.take());
+        Ok(())
     }
 
     fn cancel(&mut self, err: LlamaError) {
@@ -318,12 +327,12 @@ enum SamplerKind {
 }
 
 impl SamplerKind {
-    fn into_sampler(self) -> LlamaSampler {
+    fn into_sampler(self, n_vocab: i32) -> LlamaSampler {
         match self {
             SamplerKind::Penalties {
                 penalty_last_n,
                 penalty_repeat,
-            } => LlamaSampler::penalties_simple(penalty_last_n, penalty_repeat),
+            } => LlamaSampler::penalties_simple(n_vocab, penalty_last_n, penalty_repeat),
             SamplerKind::TopK { k } => LlamaSampler::top_k(k),
             SamplerKind::TopP { p, min_keep } => LlamaSampler::top_p(p, min_keep),
             SamplerKind::Temp { t } => LlamaSampler::temp(t),
@@ -414,7 +423,8 @@ fn build_sampler(
     let kinds = sampler_chain(params);
     // An empty chain means temperature <= 0, i.e. greedy decoding.
     let greedy = kinds.is_empty();
-    samplers.extend(kinds.into_iter().map(SamplerKind::into_sampler));
+    let n_vocab = model.n_vocab();
+    samplers.extend(kinds.into_iter().map(|k| k.into_sampler(n_vocab)));
     if greedy {
         // Greedy is the chain's *tail*, not the whole sampler: with a grammar
         // present the mask has to run first. A lone grammar sampler would
@@ -1204,8 +1214,11 @@ impl Scheduler<'_> {
             let token = slot.sampler.sample(&self.ctx, batch_idx);
 
             if self.model.is_eog_token(token) {
-                slot.finish();
-                self.retire(&mut slot, seq_id);
+                if let Err(e) = slot.finish() {
+                    self.abandon(&mut slot, seq_id, e);
+                } else {
+                    self.retire(&mut slot, seq_id);
+                }
                 continue;
             }
 
@@ -1219,8 +1232,11 @@ impl Scheduler<'_> {
                         // truncated at the match, so this is an ordinary
                         // successful finish — the caller gets the output that
                         // preceded the stop, without the stop text itself.
-                        slot.finish();
-                        self.retire(&mut slot, seq_id);
+                        if let Err(e) = slot.finish() {
+                            self.abandon(&mut slot, seq_id, e);
+                        } else {
+                            self.retire(&mut slot, seq_id);
+                        }
                         continue;
                     }
                     Emit::Disconnected => {
@@ -1231,15 +1247,19 @@ impl Scheduler<'_> {
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("Detokenization error: {e}");
-                    slot.utf8_buf.clear();
+                    self.abandon(&mut slot, seq_id, e);
+                    continue;
                 }
             }
 
             if slot.gen_count as u32 >= slot.max_tokens
                 || slot.kv_pos as u32 >= self.per_slot_budget
             {
-                slot.finish();
-                self.retire(&mut slot, seq_id);
+                if let Err(e) = slot.finish() {
+                    self.abandon(&mut slot, seq_id, e);
+                } else {
+                    self.retire(&mut slot, seq_id);
+                }
                 continue;
             }
 
@@ -1550,7 +1570,7 @@ mod tests {
             resp: Some(resp_tx),
             ..base_slot()
         };
-        slot.finish();
+        assert!(slot.finish().is_ok());
         let result = resp_rx.blocking_recv().unwrap().unwrap();
         assert_eq!(result.text, "hello world");
         assert_eq!(result.prompt_tokens, 3);
@@ -1568,7 +1588,7 @@ mod tests {
             done_tx: Some(done_tx),
             ..base_slot()
         };
-        slot.finish();
+        assert!(slot.finish().is_ok());
         let result = done_rx.blocking_recv().unwrap().unwrap();
         assert_eq!(result.text, "hi");
         assert_eq!(result.prompt_tokens, 1);
@@ -1717,13 +1737,42 @@ mod tests {
             done_tx: Some(done_tx),
             ..base_slot()
         };
-        slot.finish();
+        assert!(slot.finish().is_ok());
         let via_resp = resp_rx.blocking_recv().unwrap().unwrap();
         let via_done = done_rx.blocking_recv().unwrap().unwrap();
         assert_eq!(via_resp.text, "hello world");
         assert_eq!(via_done.text, "hello world");
         assert_eq!(via_resp.prompt_tokens, 3);
         assert_eq!(via_done.generated_tokens, 5);
+    }
+
+    #[test]
+    fn test_slot_finish_fails_on_incomplete_utf8_tail() {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let mut slot = Slot {
+            n_prompt: 3,
+            gen_count: 5,
+            kv_pos: 5,
+            text: "hello ".into(),
+            utf8_buf: vec![0xF0, 0x9F], // incomplete 4-byte emoji
+            resp: Some(resp_tx),
+            done_tx: Some(done_tx),
+            ..base_slot()
+        };
+        let res = slot.finish();
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(matches!(err, LlamaError::Inference(_)));
+        assert!(
+            err.to_string()
+                .contains("incomplete UTF-8 sequence at end of generation")
+        );
+
+        let r1_err = resp_rx.blocking_recv().unwrap().unwrap_err();
+        let r2_err = done_rx.blocking_recv().unwrap().unwrap_err();
+        assert!(matches!(r1_err, LlamaError::Inference(_)));
+        assert!(matches!(r2_err, LlamaError::Inference(_)));
     }
 
     #[test]
@@ -1851,7 +1900,7 @@ mod tests {
         };
         assert_eq!(slot.push_text("done <|"), Emit::Continue);
         assert_eq!(drain(&mut rx), "done ");
-        slot.finish();
+        assert!(slot.finish().is_ok());
         assert_eq!(drain(&mut rx), "<|", "withheld tail must be flushed");
         assert_eq!(done_rx.blocking_recv().unwrap().unwrap().text, "done <|");
     }
@@ -1972,7 +2021,7 @@ mod tests {
         // `tests/integration.rs`, since `LlamaSampler::grammar` needs a
         // vocabulary.
         for kind in sampler_chain(default_params()) {
-            drop(kind.into_sampler());
+            drop(kind.into_sampler(32000));
         }
         drop(LlamaSampler::greedy());
     }
@@ -2334,7 +2383,7 @@ mod tests {
             }
             let expected = slot.text.clone();
             if !stopped {
-                slot.finish();
+                assert!(slot.finish().is_ok());
             }
             // `finish` takes `text`, so compare against the snapshot above.
             let streamed = drain(&mut rx);

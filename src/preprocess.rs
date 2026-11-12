@@ -135,21 +135,27 @@ pub(crate) fn build_messages(
 
 /// Compute the generation budget for a prompt, enforcing the per-slot cap.
 ///
-/// Returns an error when the prompt alone exhausts the slot budget.
+/// Returns an error when `max_tokens` is 0 (protocol error), or when the
+/// prompt alone exhausts the slot budget (`PromptTooLong`).
 pub(crate) fn compute_max_gen(
     n_prompt: usize,
     max_tokens: Option<u32>,
     per_slot_budget: u32,
 ) -> std::result::Result<u32, LlamaError> {
-    let max_tokens = max_tokens.unwrap_or(256);
-    let max_gen = max_tokens.min(per_slot_budget.saturating_sub(n_prompt as u32));
-    if max_gen == 0 {
+    if let Some(0) = max_tokens {
+        return Err(LlamaError::Protocol(
+            "max_tokens must be greater than zero".into(),
+        ));
+    }
+    let budget_remaining = per_slot_budget.saturating_sub(n_prompt as u32);
+    if budget_remaining == 0 {
         return Err(LlamaError::PromptTooLong {
             tokens: n_prompt,
             budget: per_slot_budget,
         });
     }
-    Ok(max_gen)
+    let max_tokens = max_tokens.unwrap_or(256);
+    Ok(max_tokens.min(budget_remaining))
 }
 
 /// Resolve the generation parameters for a tokenized prompt, applying the
@@ -335,6 +341,16 @@ mod tests {
     #[test]
     fn test_compute_max_gen_zero_budget() {
         assert!(compute_max_gen(100, None, 0).is_err());
+    }
+
+    #[test]
+    fn test_compute_max_gen_zero_max_tokens() {
+        let err = compute_max_gen(10, Some(0), 512).unwrap_err();
+        assert!(matches!(err, LlamaError::Protocol(_)));
+        assert_eq!(
+            err.to_string(),
+            "protocol error: max_tokens must be greater than zero"
+        );
     }
 
     #[test]
